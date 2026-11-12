@@ -1,6 +1,6 @@
-# caddy-sqlite
+Imagine if Caddy was more than just a web server in front of your app. If all you need is basic CRUD for a single tenant without world-domination scale, SQLite may be the perfect database. On their own, neither is a backend. Together Caddy becomes your application. No proxies. No ORM. No separate container. No orchestrate.
 
-Imagine if Caddy was more than just a web server in front of your app. If all you need is basic CRUD for a single tenant without world-domination scale, SQLite may be the perfect database. On their own, neither is a backend. Together Caddy becomes your application. No proxies. No ORM. No separate container. No orchestrate. **One binary, one config, one database... DONE!**
+# **One binary, one config, one database... DONE!**
 
 This module gives you the SQL primitive that makes it possible: batched writes, a shared per-database cache, five output formats, versioned migrations, scheduled backups, and a `{{ sqlite }}` template function that shares the cache with every handler. Write the query, bind the params, ship.
 
