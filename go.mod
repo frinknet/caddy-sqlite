@@ -1,4 +1,4 @@
-module caddysqlite
+module github.com/frinknet/caddy-sqlite
 
 go 1.22
 
