@@ -1,0 +1,15 @@
+.git
+.gitignore
+.idea
+.vscode
+*.md
+LICENSE
+Dockerfile
+.dockerignore
+*.db
+*.db-shm
+*.db-wal
+**/*.db
+**/*.db-shm
+**/*.db-wal
+*.test
