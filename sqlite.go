@@ -3,8 +3,7 @@ package caddysqlite
 import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
-
-	"caddysqlite/pkg/plugin"
+	"github.com/frinknet/caddy-sqlite/pkg/plugin"
 )
 
 func init() {
