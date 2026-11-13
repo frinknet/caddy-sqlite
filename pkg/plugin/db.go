@@ -14,7 +14,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"go.uber.org/zap"
 
-	"caddysqlite/pkg/database"
+	"github.com/frinknet/caddy-sqlite/pkg/database"
 )
 
 var (

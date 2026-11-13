@@ -6,7 +6,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 
-	"caddysqlite/pkg/database"
+	"github.com/frinknet/caddy-sqlite/pkg/database"
 )
 
 type SQLiteTemplateFuncs struct {

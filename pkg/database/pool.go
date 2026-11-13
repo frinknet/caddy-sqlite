@@ -10,7 +10,7 @@ import (
 
     "golang.org/x/sync/singleflight"
 
-    "caddysqlite/pkg/cache"
+    "github.com/frinknet/caddy-sqlite/pkg/cache"
 )
 
 type Profile struct {

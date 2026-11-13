@@ -5,7 +5,7 @@ import (
     "fmt"
     "net/http"
 
-    "caddysqlite/pkg/database"
+    "github.com/frinknet/caddy-sqlite/pkg/database"
 )
 
 type response struct {

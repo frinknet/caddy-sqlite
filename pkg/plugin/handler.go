@@ -13,7 +13,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 
-	"caddysqlite/pkg/database"
+	"github.com/frinknet/caddy-sqlite/pkg/database"
 )
 
 type Bind struct {
