@@ -79,7 +79,8 @@ COPY             www                       /srv/www
 
 RUN ["/bin/toybox", "sh", "-c", "cd /bin && for i in $(./toybox); do if [ \"$i\" != toybox ]; then ./toybox ln -s toybox \"$i\"; fi; done && test -L /bin/sh && test -L /bin/ls"]
 RUN mkdir -p /etc/caddy /var/lib/caddy /var/cache/caddy /tmp && chmod 1777 /tmp
-RUN mv /srv/www/Caddyfile /etc/caddy/Caddyfile
+RUN mv /srv/www/Caddyfile /etc/caddy/Caddyfile \
+ && mv /srv/www/rest.caddyfile /etc/caddy/rest.caddyfile
 
 VOLUME ["/var/lib/caddy"]
 

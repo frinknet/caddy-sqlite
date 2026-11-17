@@ -19,6 +19,10 @@ import (
 )
 
 const (
+	// defaultOptimizeInterval is SQLite's own recommendation for PRAGMA
+	// optimize: about once a day, bounded by analysis_limit.
+	defaultOptimizeInterval = 24 * time.Hour
+
 	defaultBatchSize    = 128
 	defaultBatchTimeout = 5 * time.Millisecond
 	defaultCacheTTL     = 5 * time.Second
@@ -201,11 +205,15 @@ func parseDBBlock(d *caddyfile.Dispenser) (*DBConfig, error) {
 		case "readonly":
 			cfg.ReadOnly = true
 		case "optimize":
+			// Bare `optimize` takes the default interval; `optimize 0` turns it
+			// off. SQLite's own guidance is to run PRAGMA optimize about once a
+			// day, so that is the default rather than "off".
 			if !d.NextArg() {
-				return nil, d.ArgErr()
+				cfg.Optimize = defaultOptimizeInterval
+				continue
 			}
 			dur, err := caddy.ParseDuration(d.Val())
-			if err != nil || dur <= 0 {
+			if err != nil || dur < 0 {
 				return nil, d.Errf("optimize: %v", err)
 			}
 			cfg.Optimize = dur
@@ -273,12 +281,13 @@ func joinArgs(args []string) string {
 // Engine is the app: it owns the cluster, applies migrations, and starts the
 // per-database maintenance jobs.
 type Engine struct {
-	engine  EngineConfig
-	dbs     []*DBConfig
-	cluster *database.Cluster
-	stops   []func()
-	handles []*sql.DB
-	log     *zap.Logger
+	engine      EngineConfig
+	dbs         []*DBConfig
+	cluster     *database.Cluster
+	stops       []func()
+	handles     []*sql.DB
+	handlesByDB map[string]*sql.DB
+	log         *zap.Logger
 }
 
 func (Engine) CaddyModule() caddy.ModuleInfo {
@@ -385,6 +394,14 @@ func (m *Engine) migrate(ctx caddy.Context, cfg *DBConfig) error {
 	return nil
 }
 
+// maintenanceDB returns the handle kept for a database's scheduled work, or nil.
+func (m *Engine) maintenanceDB(cfg *DBConfig) *sql.DB {
+	if db, ok := m.handlesByDB[cfg.Name]; ok {
+		return db
+	}
+	return nil
+}
+
 func (m *Engine) startMaintenance(cfg *DBConfig) error {
 	if cfg.Optimize <= 0 && cfg.Backup == nil {
 		return nil
@@ -394,6 +411,10 @@ func (m *Engine) startMaintenance(cfg *DBConfig) error {
 		return fmt.Errorf("db %q: maintenance handle: %w", cfg.Name, err)
 	}
 	m.handles = append(m.handles, db)
+	if m.handlesByDB == nil {
+		m.handlesByDB = map[string]*sql.DB{}
+	}
+	m.handlesByDB[cfg.Name] = db
 
 	if cfg.Optimize > 0 && !cfg.ReadOnly {
 		stop := make(chan struct{})
@@ -419,6 +440,20 @@ func (m *Engine) cleanup() {
 	for _, stop := range m.stops {
 		stop()
 	}
+	// SQLite recommends running PRAGMA optimize when a connection is about to
+	// close; this is that moment. Only for databases that opted in.
+	for _, cfg := range m.dbs {
+		if cfg.Optimize <= 0 || cfg.ReadOnly {
+			continue
+		}
+		db := m.maintenanceDB(cfg)
+		if db == nil {
+			continue
+		}
+		if err := maintainOnce(context.Background(), db); err != nil && m.log != nil {
+			m.log.Warn("final maintenance failed", zap.String("db", cfg.Name), zap.Error(err))
+		}
+	}
 	m.stops = nil
 	for _, db := range m.handles {
 		db.Close()
@@ -443,6 +478,49 @@ func (m *Engine) DBConfig(name string) (*DBConfig, bool) {
 	return nil, false
 }
 
+const (
+	// optimizeAnalysisLimit bounds how much of each index ANALYZE may read. Our
+	// request path is cached and index-driven, so planner statistics matter
+	// mostly for the first miss after a cache window: a few hundred rows per
+	// index is already representative for the query shapes this module serves
+	// (equality and range lookups, small ORDER BYs), and it keeps the pass short
+	// while requests are in flight. Higher buys nothing our plans can use.
+	optimizeAnalysisLimit = 400
+)
+
+// maintainOnConn runs the maintenance pair this module actually needs, on one
+// borrowed connection. Both statements share it because analysis_limit is
+// connection state.
+//
+// The checkpoint comes first so the ANALYZE reads the main file rather than a
+// WAL that has been accumulating since the last one. PASSIVE rather than
+// TRUNCATE: it never blocks readers or the writer, and the WAL is already bounded
+// by wal_autocheckpoint=2000, so the goal is folding committed pages back into
+// the main file (cheaper cold reads, smaller VACUUM INTO backups), not shrinking
+// a file that will regrow. A busy result is not an error: the next pass catches up.
+func maintainOnConn(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
+		return fmt.Errorf("wal_checkpoint: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA analysis_limit=%d", optimizeAnalysisLimit)); err != nil {
+		return fmt.Errorf("analysis_limit: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA optimize"); err != nil {
+		return fmt.Errorf("optimize: %w", err)
+	}
+	return nil
+}
+
+// maintainOnce borrows a connection for one maintenance pass.
+func maintainOnce(ctx context.Context, db *sql.DB) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return maintainOnConn(ctx, conn)
+}
+
 func runOptimize(stop chan struct{}, db *sql.DB, every time.Duration, log *zap.Logger) {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
@@ -451,8 +529,8 @@ func runOptimize(stop chan struct{}, db *sql.DB, every time.Duration, log *zap.L
 		case <-stop:
 			return
 		case <-ticker.C:
-			if _, err := db.Exec("PRAGMA optimize"); err != nil && log != nil {
-				log.Warn("optimize failed", zap.Error(err))
+			if err := maintainOnce(context.Background(), db); err != nil && log != nil {
+				log.Warn("maintenance failed", zap.Error(err))
 			}
 		}
 	}

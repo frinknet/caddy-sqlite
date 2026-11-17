@@ -175,14 +175,23 @@ func WriteTarget(sqlText string) (string, error) {
 	return "", nil
 }
 
-// schemaOf splits "schema.table" and unquotes a quoted identifier.
+// schemaOf splits "schema.table" and unquotes a quoted identifier. A prefix that
+// is not an identifier is not a schema: declared names are identifiers, so
+// anything else is malformed SQL and is reported as an unqualified write.
 func schemaOf(target string) string {
 	target = strings.TrimSpace(target)
-	if i := strings.Index(target, "."); i >= 0 {
-		return unquoteIdentifier(target[:i])
+	i := strings.Index(target, ".")
+	if i < 0 {
+		return ""
 	}
-	return ""
+	name := unquoteIdentifier(target[:i])
+	if !identifierRe.MatchString(name) {
+		return ""
+	}
+	return name
 }
+
+var identifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func unquoteIdentifier(s string) string {
 	s = strings.TrimSpace(s)

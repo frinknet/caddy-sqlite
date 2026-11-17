@@ -57,7 +57,7 @@ TPL
 
 # ── Reusable REST snippet under test ───────────────────
 mkdir -p "$TMP/snippets"
-cp snippets/rest.caddyfile "$TMP/snippets/rest.caddyfile"
+cp www/rest.caddyfile "$TMP/snippets/rest.caddyfile"
 
 # Pre-create the backup dir so it stays host-owned: the container writes
 # root-owned files into it, and only a writable directory lets the user

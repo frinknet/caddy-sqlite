@@ -1,7 +1,7 @@
 # Reusable REST CRUD for one resource, built on the `sqlite` handler.
 #
 # The snippet is defined at the top level, outside any site block:
-#   import snippets/rest.caddyfile
+#   import rest.caddyfile
 # Then, inside a site block:
 #   import rest notes  app.notes    body
 #   import rest assets media.assets name
@@ -22,6 +22,16 @@
 #   @patch  method PATCH
 #   @delete method DELETE
 #
+# The target table needs three columns:
+#
+#   CREATE TABLE tags (
+#       id         INTEGER PRIMARY KEY AUTOINCREMENT,   -- path parameter
+#       name       TEXT NOT NULL,                       -- {args[2]}
+#       created_at TEXT NOT NULL DEFAULT (datetime('now'))
+#   );
+#
+# A missing column fails at request time, not at `caddy validate`.
+#
 # {args[N]} is substituted textually when the Caddyfile is read, so it may name
 # tables and columns. Request data never reaches SQL that way: it arrives as a
 # bind, which the driver passes as a parameter.
@@ -29,6 +39,7 @@
 	@list_{args[0]} path /api/{args[0]}
 	@item_{args[0]} path_regexp {args[0]} ^/api/{args[0]}/(?P<id>[0-9]+)$
 
+	# ── /api/<resource> ────────────────────────────────────────────────
 	handle @list_{args[0]} {
 		handle @get {
 			sqlite {
@@ -37,6 +48,7 @@
 				output json
 			}
 		}
+
 		handle @post {
 			sqlite {
 				query  "INSERT INTO {args[1]} ({args[2]})
@@ -47,24 +59,31 @@
 				status 201
 			}
 		}
+
 		respond "method not allowed" 405
 	}
 
+	# ── /api/<resource>/<id> ───────────────────────────────────────────
 	handle @item_{args[0]} {
+		# One row by construction: the aggregate always returns a row, so
+		# `output dynamic` gets exactly what it needs, and a missing id becomes
+		# a 404 carried by the row itself instead of an empty result.
 		handle @get {
 			sqlite {
-				query  "SELECT CASE WHEN id IS NULL
+				query  "SELECT CASE WHEN COUNT(*) = 0
 				                  THEN json_object('error', 'not found')
-				                  ELSE json_object('id', id, '{args[2]}', {args[2]}, 'created_at', created_at)
+				                  ELSE json_object('id', MAX(id),
+				                                   '{args[2]}', MAX({args[2]}),
+				                                   'created_at', MAX(created_at))
 				             END AS content,
 				             'application/json' AS content_type,
-				             CASE WHEN id IS NULL THEN 404 ELSE 200 END AS http_code
-				        FROM (SELECT id, {args[2]}, created_at FROM {args[1]} WHERE id = :id
-				              UNION ALL SELECT NULL, NULL, NULL LIMIT 1)"
+				             CASE WHEN COUNT(*) = 0 THEN 404 ELSE 200 END AS http_code
+				        FROM {args[1]} WHERE id = :id"
 				bind   id {re.{args[0]}.id}
 				output dynamic
 			}
 		}
+
 		handle @put {
 			sqlite {
 				query  "UPDATE {args[1]} SET {args[2]} = json_extract(:body, '$.{args[2]}')
@@ -75,6 +94,7 @@
 				output json
 			}
 		}
+
 		handle @patch {
 			sqlite {
 				query  "UPDATE {args[1]}
@@ -86,6 +106,7 @@
 				output json
 			}
 		}
+
 		handle @delete {
 			sqlite {
 				query  "DELETE FROM {args[1]} WHERE id = :id"
@@ -94,6 +115,7 @@
 				status 204
 			}
 		}
+
 		respond "method not allowed" 405
 	}
 }

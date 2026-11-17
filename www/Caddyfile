@@ -17,34 +17,49 @@
 			migrate  /srv/www/migrations
 			optimize 24h
 		}
+
+		# The scratch schema: no file, rebuilt from migrations on every start.
+		db main {
+			migrate /srv/www/scratch-migrations
+		}
 	}
 }
 
+# The REST snippet lives next to this file and is installed beside it in the
+# image (outside the served root, so it is not downloadable). Snippets are
+# defined at the top level, outside any site block.
+import rest.caddyfile
+
 :80 {
-	# Read: cached, served from the shared LRU for cache_ttl. A write anywhere
-	# bumps the generation counter, which invalidates it.
-	handle /api/notes {
+	# The snippet needs the method matchers declared once per site; matcher
+	# names are unique per site, so a snippet cannot declare them itself.
+	@get    method GET
+	@post   method POST
+	@put    method PUT
+	@patch  method PATCH
+	@delete method DELETE
+
+	# Two resources, one line each. This is the entire CRUD surface:
+	#   GET    /api/notes      list        POST   /api/notes      create (201)
+	#   GET    /api/notes/1    fetch       PUT    /api/notes/1    replace
+	#   PATCH  /api/notes/1    update      DELETE /api/notes/1    remove (204)
+	import rest notes app.notes body
+	import rest tags  app.tags  name
+
+	# Fire-and-forget: this handler answers nothing, the next one owns the
+	# response. The row lands in the in-memory scratch, which no write can
+	# invalidate and no restart keeps.
+	handle /api/audit {
 		sqlite {
-			query  "SELECT id, body, created_at FROM app.notes ORDER BY id DESC"
-			output json
+			query    "INSERT INTO main.audit (path) VALUES (?)"
+			bind     1 {http.request.uri.path}
+			continue
 		}
+		respond "queued" 202
 	}
 
-	# Write: rides app's batcher and bumps the generation counter on commit.
-	# Accepts either a JSON object with a "body" field or a raw text body.
-	handle /api/notes/add {
-		sqlite {
-			query  "INSERT INTO app.notes (body) VALUES (
-			            CASE WHEN json_valid(:body)
-			                 THEN COALESCE(json_extract(:body, '$.body'), :body)
-			                 ELSE :body END
-			        ) RETURNING id, body, created_at"
-			bind   body {http.request.body}
-			output json
-			status 201
-		}
-	}
-
+	# One hand-written query, for what a snippet does not cover: a cached
+	# aggregate that any write anywhere invalidates.
 	handle /api/health {
 		sqlite {
 			query  "SELECT COUNT(*) AS notes FROM app.notes"

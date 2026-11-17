@@ -50,7 +50,11 @@ async function refresh() {
 document.getElementById('add').addEventListener('submit', async e => {
   e.preventDefault();
   const body = document.getElementById('body');
-  await fetch('/api/notes/add', { method: 'POST', body: body.value });
+  await fetch('/api/notes', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: body.value }),
+  });
   body.value = '';
   refresh();
 });

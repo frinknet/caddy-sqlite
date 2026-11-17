@@ -191,6 +191,10 @@ from the statement itself — `INSERT/REPLACE INTO`, `UPDATE`, `DELETE FROM`,
 Reads are not parsed: they may touch as many schemas as they like, and a wrong
 name is SQLite's error to report.
 
+A ready-made CRUD resource built on this directive — list, create, fetch, update,
+patch and delete with the right status codes — ships in `www/rest.caddyfile`;
+see [Reusable REST pattern](#reusable-rest-pattern).
+
 **`continue`** turns the handler into a producer for the rest of the chain:
 
 ```caddyfile
@@ -464,14 +468,57 @@ Acceptable for template rendering.
 
 ```caddyfile
 db app /var/lib/caddy/app.db {
-	optimize 24h
+	optimize          # bare: the default interval
+	optimize 6h       # or an explicit one
+	optimize 0        # off
 }
 ```
 
-The module runs it on a maintenance handle opened for that database, once per
-interval, in a background goroutine. It doesn't go through the batcher (single statement, once a
-day) and doesn't bump the generation (there are no cacheable results to
-invalidate — `sqlite_stat1` affects query planning, not query results).
+**Bare `optimize` means once a day**, because that is SQLite's own guidance for
+`PRAGMA optimize`: it is cheap, it does nothing unless a table's statistics are
+stale enough to matter, and it is meant to run periodically rather than per query.
+`optimize 0` turns it off; an explicit duration overrides the default.
+
+What the module issues is a pair tuned to this engine's own defaults, not the bare
+statement:
+
+```sql
+PRAGMA wal_checkpoint(PASSIVE);   -- fold the WAL back into the main file
+PRAGMA analysis_limit=400;        -- bound how much of each index ANALYZE may read
+PRAGMA optimize;                  -- ANALYZE only the tables whose stats are stale
+```
+
+Each choice follows from how the module is configured, and the numbers are
+deliberate:
+
+- **The checkpoint comes first** so the ANALYZE reads the main file instead of a
+  WAL that has been accumulating since the last pass. It also makes cold reads
+  cheaper and `VACUUM INTO` backups smaller.
+- **`PASSIVE`, never `TRUNCATE`.** The WAL is already bounded by
+  `wal_autocheckpoint=2000`, so the point is folding committed pages back into the
+  main file, not shrinking a file that will regrow. `PASSIVE` cannot block readers
+  or the writer; a busy result is not an error, and the next pass catches up.
+- **`analysis_limit=400`, not SQLite's example 1000.** Reads here are cached and
+  index-driven, so planner statistics matter mainly for the first miss after a
+  cache window. A few hundred rows per index is already representative for the
+  query shapes this module serves (equality and range lookups, small `ORDER BY`s),
+  and it keeps the pass short while requests are in flight. A larger sample buys
+  nothing the plans can use.
+- **All three run on one borrowed connection**, because `analysis_limit` is
+  connection state. Nothing is set globally, so the request path is unaffected.
+
+Two more properties:
+
+- **A final pass runs at shutdown.** SQLite recommends running `PRAGMA optimize`
+  when a connection is about to close, so the module does exactly that for every
+  database that opted in — the last thing before its maintenance handle closes.
+- **Nothing is batched and nothing is invalidated.** It doesn't go through the
+  batcher (a few statements, once a day) and doesn't bump the generation counter:
+  there are no cacheable results to invalidate, since `sqlite_stat1` affects query
+  planning, not query results.
+
+**Do not put `PRAGMA optimize` in a handler** — at request rate it is a no-op with
+per-request overhead. This sub-directive exists precisely to prevent that.
 
 ## Tuning reference
 
@@ -511,12 +558,15 @@ engine-wide.
 
 ## Reusable REST pattern
 
-`snippets/rest.caddyfile` ships a full CRUD resource — list, create, fetch,
-update, patch, delete with `201`/`404`/`204`/`405` responses. Import it at the top
-level, declare the method matchers once per site, then instantiate it per resource:
+`www/rest.caddyfile` ships a full CRUD resource — list, create, fetch, update,
+patch, delete with `201`/`404`/`204`/`405` responses. The demo image installs it
+next to the Caddyfile (`/etc/caddy/rest.caddyfile`, outside the served root), and
+the demo config uses it for `/api/tags`. Import it at the top level, declare the
+method matchers once per site, then instantiate it per resource:
 
 ```caddyfile
-import snippets/rest.caddyfile
+# next to the Caddyfile that imports it
+import rest.caddyfile
 
 example.com {
 	@get    method GET
@@ -535,6 +585,28 @@ Arguments are `{args[0]}` resource name (path segment, matcher suffix and
 exposed as `body`. They are substituted textually when the Caddyfile is read, so
 they may name tables and columns; request data never reaches SQL that way, because
 it arrives as a bind.
+
+**Required table shape.** The snippet's queries reference three columns, so the
+target table needs all three:
+
+```sql
+CREATE TABLE tags (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,                       -- {args[2]}, exposed as "body"
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+`id` is the path parameter and the lookup key, `{args[2]}` is the column the
+request body writes to and the response returns as `body`, and `created_at` is
+returned with every row. A missing column is a runtime SQLite error, not a config
+error, so create the table (a migration is the natural place) before the first
+request.
+
+Two behaviours worth knowing: `DELETE` answers `204` even when no row matched, and
+the `POST`/`PUT`/`PATCH` bodies are read as JSON with the field named after
+`{args[2]}` (`{"name":"…"}` for the `tags` example) — a raw text body is not
+accepted by the snippet.
 
 ## Full example
 

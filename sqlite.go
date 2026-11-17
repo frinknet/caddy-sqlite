@@ -21,3 +21,12 @@ func init() {
 
 	httpcaddyfile.RegisterDirectiveOrder("sqlite", "before", "respond")
 }
+
+// Registered as modules: the handler is a *SQLite because its CaddyModule has a
+// pointer receiver (the type holds a sync.Mutex), while the app and the template
+// functions are safe to register by value.
+var (
+	_ caddy.Module = plugin.Engine{}
+	_ caddy.Module = (*plugin.SQLite)(nil)
+	_ caddy.Module = plugin.SQLiteTemplateFuncs{}
+)
