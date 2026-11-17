@@ -19,6 +19,7 @@ import (
 
 // newTestEngine builds an engine around a real cluster: two writable schemas
 // (app, media) plus the in-memory scratch, and one read-only schema (ro).
+
 func newTestEngine(t *testing.T, profile database.Profile) *Engine {
 	t.Helper()
 	dir := t.TempDir()
@@ -268,6 +269,103 @@ func TestHandlerParseBinds(t *testing.T) {
 }`)
 	if err := few.parseBinds(); err == nil {
 		t.Fatal("placeholder count mismatch must fail")
+	}
+}
+
+func TestHandlerNamedBindValidation(t *testing.T) {
+	ok := []struct {
+		name string
+		body string
+	}{
+		{"all used", `sqlite {
+	query "UPDATE app.notes SET body = :body WHERE id = :id"
+	bind  body {http.request.body}
+	bind  id   {http.request.uri.query.id}
+}`},
+		{"placeholder in a string literal is not a bind", `sqlite {
+	query "SELECT body FROM app.notes WHERE created_at = '12:30' AND id = :id"
+	bind  id {http.request.uri.query.id}
+}`},
+		{"repeated placeholder", `sqlite {
+	query "SELECT body FROM app.notes WHERE id = :id OR asset_id = :id"
+	bind  id {http.request.uri.query.id}
+}`},
+	}
+	for _, c := range ok {
+		t.Run(c.name, func(t *testing.T) {
+			m, err := parseHandler(t, c.body)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if err := m.parseBinds(); err != nil {
+				t.Fatalf("parseBinds: %v", err)
+			}
+		})
+	}
+
+	bad := []struct {
+		name string
+		body string
+	}{
+		{"placeholder with no bind", `sqlite {
+	query "UPDATE app.notes SET body = :body WHERE id = :id"
+	bind  body {http.request.body}
+}`},
+		{"bind with no placeholder", `sqlite {
+	query "UPDATE app.notes SET body = :body WHERE id = :id"
+	bind  body {http.request.body}
+	bind  id   {http.request.uri.query.id}
+	bind  extra {http.request.uri.query.extra}
+}`},
+		{"named binds with positional sql", `sqlite {
+	query "UPDATE app.notes SET body = ? WHERE id = ?"
+	bind  body {http.request.body}
+	bind  id   {http.request.uri.query.id}
+}`},
+	}
+	for _, c := range bad {
+		t.Run(c.name, func(t *testing.T) {
+			m, err := parseHandler(t, c.body)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if err := m.parseBinds(); err == nil {
+				t.Fatalf("expected %s to be rejected", c.name)
+			}
+		})
+	}
+}
+
+func TestHandlerSchemaNamesAreCaseInsensitive(t *testing.T) {
+	engine := newTestEngine(t, testProfile())
+
+	cases := []struct {
+		query string
+		want  string
+	}{
+		{`INSERT INTO app.notes (body) VALUES ('x')`, "app"},
+		{`INSERT INTO "APP".notes (body) VALUES ('x')`, "app"},
+		{`INSERT INTO App.notes (body) VALUES ('x')`, "app"},
+		{`INSERT INTO main.hits (path) VALUES ('/x')`, "main"},
+		{`INSERT INTO MAIN.hits (path) VALUES ('/x')`, "main"},
+	}
+	for _, c := range cases {
+		m := &SQLite{Query: c.query, engine: engine, log: zap.NewNop()}
+		schema, err := m.writeSchema()
+		if err != nil {
+			t.Fatalf("%s: writeSchema: %v", c.query, err)
+		}
+		canonical, ok := engine.CanonicalSchema(schema)
+		if !ok {
+			t.Fatalf("%s: %q is not declared", c.query, schema)
+		}
+		if canonical != c.want {
+			t.Fatalf("%s: resolved to %q, want %q", c.query, canonical, c.want)
+		}
+	}
+
+	if _, ok := engine.CanonicalSchema("nope"); ok {
+		t.Fatal("an undeclared schema must not resolve")
 	}
 }
 
@@ -643,4 +741,108 @@ func TestHandlerCachedReadServedUntilWrite(t *testing.T) {
 	if !strings.Contains(w.Body.String(), `"n":2`) {
 		t.Fatalf("second read = %s, want 2", w.Body.String())
 	}
+}
+
+func FuzzParseHandler(f *testing.F) {
+	seeds := []string{
+		`sqlite {
+	query "SELECT 1"
+}`,
+		`sqlite {
+	query  "INSERT INTO app.notes (body) VALUES (?)"
+	bind   1 {http.request.body}
+	output json
+}`,
+		`sqlite {
+	query  "INSERT INTO app.notes (body) VALUES (:body)"
+	bind   body {http.request.body}
+	output none
+	status 204
+}`,
+		`sqlite {
+	query "SELECT 1"
+	continue
+}`,
+		`sqlite {`,
+		`sqlite { query }`,
+		`sqlite { query "" bind 1 }`,
+		`sqlite { output }`,
+		`sqlite { cache }`,
+		`sqlite { status }`,
+		`sqlite { bind 1 2 bind 2 1 query "SELECT ? , ?" }`,
+		`sqlite { query "SELECT ?" bind a {x} bind 1 {y} }`,
+		``,
+		`{`,
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, cfg string) {
+		m := new(SQLite)
+		if err := m.UnmarshalCaddyfile(caddyfile.NewTestDispenser(cfg)); err != nil {
+			return // rejected input is a legitimate answer
+		}
+		if err := m.parseBinds(); err != nil {
+			return
+		}
+		if _, err := m.writeSchema(); err != nil {
+			return
+		}
+	})
+}
+
+func BenchmarkServeHTTPCachedRead(b *testing.B) {
+	engine := newBenchEngine(b)
+	m := &SQLite{Query: `SELECT id, body FROM app.notes`, Output: "json", engine: engine, log: zap.NewNop()}
+	if err := m.parseBinds(); err != nil {
+		b.Fatal(err)
+	}
+	m.plan, _ = database.Classify(m.Query)
+	m.useCache = resolveUseCache(m.plan, m.Output, m.Cache)
+
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/sql", nil).WithContext(ctx)
+		if err := m.ServeHTTP(w, req, nil); err != nil {
+			b.Fatal(err)
+		}
+		if w.Code != http.StatusOK {
+			b.Fatalf("status = %d", w.Code)
+		}
+	}
+}
+
+func newBenchEngine(b *testing.B) *Engine {
+	b.Helper()
+	dir := b.TempDir()
+	path := filepath.Join(dir, "app.db")
+	db, err := database.OpenDB(context.Background(), database.OpenConfig{Path: path})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)`); err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		if _, err := db.Exec(`INSERT INTO notes (body) VALUES ('x')`); err != nil {
+			b.Fatal(err)
+		}
+	}
+	db.Close()
+
+	profile := database.Profile{BatchSize: 128, BatchTimeout: time.Millisecond, CacheTTL: time.Minute, CacheMax: 64}
+	cluster, err := database.OpenCluster(context.Background(),
+		[]database.Attach{{Schema: "app", Path: path}}, []string{"app"}, profile)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { cluster.Close() })
+	return &Engine{engine: EngineConfig{BatchSize: 128, BatchTimeout: time.Millisecond, CacheTTL: time.Minute, CacheMax: 64},
+		dbs: []*DBConfig{{Name: "app", Path: path}}, cluster: cluster, log: zap.NewNop()}
 }

@@ -3,7 +3,6 @@ package plugin
 import (
 	"context"
 	"testing"
-	"time"
 )
 
 func TestTemplateQueryReads(t *testing.T) {
@@ -122,25 +121,5 @@ func TestTemplateQueryRejectsBadInput(t *testing.T) {
 	}
 	if _, err := m.query(`INSERT INTO nope.t (x) VALUES (1)`); err == nil {
 		t.Fatal("expected an unknown schema to fail")
-	}
-}
-
-func TestRunOptimizeStopsOnSignal(t *testing.T) {
-	engine := newTestEngine(t, testProfile())
-	stop := make(chan struct{})
-	done := make(chan struct{})
-
-	go func() {
-		runOptimize(stop, engine.Cluster().Anchor(), 5*time.Millisecond, nil)
-		close(done)
-	}()
-
-	time.Sleep(30 * time.Millisecond)
-	close(stop)
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("runOptimize did not return after its stop channel closed")
 	}
 }

@@ -110,6 +110,11 @@ sqlite {
 `main` and `temp` are reserved. Declaring is attaching: there is no separate
 attach step, and every declared database is visible to every query.
 
+**Schema names are matched the way SQLite matches them: case-insensitively.**
+`INSERT INTO "APP".notes`, `App.notes` and `app.notes` all route to the declared
+`app`, and `MAIN.hits` reaches the scratch schema. A name that matches no
+declaration is a config error, as is a write to a `readonly` one.
+
 **Path resolution:** `<file>` is literal. `{env.X}` placeholders resolve from the
 process environment at provision; a missing variable is a hard error at
 `caddy validate`.
@@ -255,6 +260,22 @@ sqlite {
 
 Rejected. The first bind's name shape determines the mode; a bind of the wrong
 shape is a parse error.
+
+### Validation
+
+Named binds are checked against the SQL at `caddy validate`, in both directions,
+because the driver only reports one of them and only at request time:
+
+- a placeholder with no `bind` line → config error (`sql uses :id but no bind
+  declares it`); at runtime the driver would say `missing named argument "id"` on
+  every request;
+- a `bind` line with no placeholder → config error (`bind "extra" is never used by
+  the sql`); the driver silently ignores extra arguments, so this would otherwise
+  look like it did something.
+
+The scan ignores comments, string literals and quoted identifiers, so
+`WHERE created_at = '12:30'` is not mistaken for a `:30` bind. Positional binds
+are validated by count instead, which the driver also enforces.
 
 ### Values
 

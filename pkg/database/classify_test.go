@@ -1,9 +1,19 @@
 package database
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// Regression guard: lowercase `pragma wal_checkpoint` is a side-effecting write.
+
+// Sanity: the comment stripper must not leave stray newlines or unbalanced
+// whitespace that breaks the keyword regex.
+
+// schemaIdentifier mirrors the identifier rule the config layer enforces on
+// database names: whatever WriteTarget returns must be usable as a schema.
+var schemaIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func TestClassifySelect(t *testing.T) {
 	tests := []struct {
@@ -195,7 +205,6 @@ func TestClassifyUnsupported(t *testing.T) {
 	}
 }
 
-// Regression guard: lowercase `pragma wal_checkpoint` is a side-effecting write.
 func TestClassifyPragmaLowercaseSideEffect(t *testing.T) {
 	got, err := Classify("pragma wal_checkpoint")
 	if err != nil {
@@ -206,10 +215,154 @@ func TestClassifyPragmaLowercaseSideEffect(t *testing.T) {
 	}
 }
 
-// Sanity: the comment stripper must not leave stray newlines or unbalanced
-// whitespace that breaks the keyword regex.
 func TestStripComments(t *testing.T) {
 	if got := stripComments("  -- x\n  SELECT 1  "); !strings.HasPrefix(got, "SELECT") {
 		t.Errorf("stripComments left leading junk: %q", got)
+	}
+}
+
+func TestScratchWriteTarget(t *testing.T) {
+	cases := []struct {
+		sql    string
+		schema string
+		err    bool
+	}{
+		{`INSERT INTO app.notes (body) VALUES ('x')`, "app", false},
+		{`INSERT OR REPLACE INTO app.notes (id) VALUES (1)`, "app", false},
+		{`UPDATE app.notes SET body = 'y' WHERE id = 1`, "app", false},
+		{`DELETE FROM app.notes WHERE id = 1`, "app", false},
+		{`INSERT INTO main.hits (path) VALUES ('/x')`, "main", false},
+		{`WITH recent AS (SELECT 1) INSERT INTO media.assets (id) VALUES (1)`, "media", false},
+		{`INSERT INTO notes (body) VALUES ('x')`, "", false},
+		{`INSERT INTO app.notes (id) SELECT id FROM media.assets`, "app", false},
+		{`INSERT INTO app.notes (id) SELECT id FROM media.assets; DELETE FROM media.assets`, "", true},
+		{`INSERT INTO "app"."notes" (id) VALUES (1)`, "app", false},
+		{`CREATE TABLE IF NOT EXISTS e2e.items (id INTEGER PRIMARY KEY)`, "e2e", false},
+		{`DROP TABLE e2e.items`, "e2e", false},
+		{`ALTER TABLE app.notes ADD COLUMN note TEXT`, "app", false},
+		{`REINDEX media.assets`, "media", false},
+		{`ANALYZE app.notes`, "app", false},
+		{`VACUUM app`, "app", false},
+		{`VACUUM`, "", false},
+		{`PRAGMA journal_mode = WAL`, "main", false},
+		{`PRAGMA app.wal_checkpoint`, "main", false},
+		{`CREATE TABLE items (id INTEGER)`, "", false},
+		{`CREATE TABLE app.a (id INTEGER); CREATE TABLE media.b (id INTEGER)`, "", true},
+	}
+	for _, c := range cases {
+		got, err := WriteTarget(c.sql)
+		if c.err {
+			if err == nil {
+				t.Errorf("%s: expected error, got %q", c.sql, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error %v", c.sql, err)
+			continue
+		}
+		if got != c.schema {
+			t.Errorf("%s: schema = %q, want %q", c.sql, got, c.schema)
+		}
+	}
+}
+
+func TestNamedPlaceholders(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want []string
+	}{
+		{`SELECT v FROM t WHERE id = :id AND kind = @kind`, []string{"id", "kind"}},
+		{`UPDATE t SET v = $v WHERE id = :id`, []string{"v", "id"}},
+		{`INSERT INTO t (v) VALUES (:v), (:v)`, []string{"v"}},
+		{`SELECT v FROM t WHERE at = '12:30'`, nil},
+		{`SELECT v FROM t WHERE note = "weird:name"`, nil},
+		{`SELECT v FROM t -- trailing :comment
+		 WHERE id = :id`, []string{"id"}},
+		{`SELECT v FROM t WHERE id = ?`, nil},
+		{`SELECT 1`, nil},
+	}
+	for _, c := range cases {
+		got := NamedPlaceholders(c.sql)
+		if len(got) != len(c.want) {
+			t.Errorf("NamedPlaceholders(%q) = %v, want %v", c.sql, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("NamedPlaceholders(%q) = %v, want %v", c.sql, got, c.want)
+				break
+			}
+		}
+	}
+}
+
+func FuzzClassify(f *testing.F) {
+	seeds := []string{
+		`SELECT id, label FROM app.notes WHERE id = ?`,
+		`INSERT INTO app.notes (body) VALUES ('x')`,
+		`INSERT INTO app.notes (id) SELECT id FROM media.assets`,
+		`UPDATE app.notes SET body = 'y' WHERE id = 1`,
+		`DELETE FROM app.notes WHERE id = 1`,
+		`CREATE TABLE IF NOT EXISTS app.t (id INTEGER PRIMARY KEY)`,
+		`DROP TABLE app.t`,
+		`ALTER TABLE app.t ADD COLUMN x TEXT`,
+		`VACUUM app`,
+		`PRAGMA wal_checkpoint`,
+		`PRAGMA app.optimize`,
+		`WITH recent AS (SELECT id FROM app.notes) INSERT INTO app.t (id) SELECT id FROM recent`,
+		`/* comment */ SELECT 1 -- trailing`,
+		`INSERT OR REPLACE INTO app.t (id) VALUES (1)`,
+		`REPLACE INTO app.t (id) VALUES (1)`,
+		`INSERT INTO "app"."notes" (id) VALUES (1)`,
+		`INSERT INTO app.notes (id) VALUES (1); DELETE FROM media.assets`,
+		`SELECT http_post('http://x', 'y')`,
+		``,
+		`'`,
+		`{`,
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, sqlText string) {
+		plan, err := Classify(sqlText)
+		if err != nil {
+			return // unclassifiable input is a legitimate answer
+		}
+
+		schema, err := WriteTarget(sqlText)
+		if err != nil {
+			// The only error WriteTarget may report is a multi-schema write.
+			return
+		}
+		if !plan.IsWrite {
+			return
+		}
+		if schema == "" {
+			return // unqualified: the handler rejects it, by design
+		}
+		if !schemaIdentifier.MatchString(schema) {
+			t.Fatalf("WriteTarget(%q) = %q, which is not an identifier", sqlText, schema)
+		}
+	})
+}
+
+func BenchmarkClassify(b *testing.B) {
+	cases := map[string]string{
+		"select":  `SELECT id, label FROM items WHERE id = ? ORDER BY id`,
+		"insert":  `INSERT INTO items (label) VALUES (?)`,
+		"cte":     `WITH recent AS (SELECT id FROM items ORDER BY id DESC LIMIT 10) SELECT * FROM recent`,
+		"pragma":  `PRAGMA wal_checkpoint`,
+		"comment": `/* leading comment */ SELECT 1 -- trailing`,
+	}
+	for name, sqlText := range cases {
+		b.Run(name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if _, err := Classify(sqlText); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

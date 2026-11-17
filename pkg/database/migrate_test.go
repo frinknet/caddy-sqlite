@@ -134,3 +134,19 @@ func TestApplyRollsBackFailedMigration(t *testing.T) {
 		t.Fatal("a failed migration left its partial work behind")
 	}
 }
+
+func BenchmarkApplyMigration(b *testing.B) {
+	ctx := context.Background()
+	fsys := fstest.MapFS{
+		"0001_init.sql": &fstest.MapFile{Data: []byte(`CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT)`)},
+		"0002_seed.sql": &fstest.MapFile{Data: []byte(`INSERT INTO items (label) VALUES ('a')`)},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db := benchmarkDB(b, Profile{})
+		if err := Apply(ctx, db.SQL(), fsys, "."); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -45,3 +45,24 @@ func TestResolveKeepsJSONBody(t *testing.T) {
 		t.Fatal("expected unresolved placeholder error")
 	}
 }
+
+func BenchmarkResolveArgs(b *testing.B) {
+	m := &SQLite{
+		Binds: []Bind{
+			{Name: "1", Value: "{http.request.body}"},
+			{Name: "2", Value: "{http.request.uri.query.page}"},
+		},
+		positional: true,
+	}
+	repl := caddy.NewReplacer()
+	repl.Set("http.request.body", `{"label":"x"}`)
+	repl.Set("http.request.uri.query.page", "3")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := m.resolveArgs(repl); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

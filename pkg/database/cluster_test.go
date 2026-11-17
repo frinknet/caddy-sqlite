@@ -261,3 +261,83 @@ func TestClusterConcurrentReadsAndWrites(t *testing.T) {
 		t.Fatalf("n = %v, want 20", rows[0]["n"])
 	}
 }
+
+func BenchmarkAnchorQueryReusedConnection(b *testing.B) {
+	attaches, _ := benchAttachFiles(b, 4)
+	db, err := OpenDB(context.Background(), OpenConfig{Path: ":memory:", Attach: attaches})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := db.QueryRow(`SELECT COUNT(*) FROM db0.items`).Scan(new(int)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkAnchorJoinParallel(b *testing.B) {
+	attaches, _ := benchAttachFiles(b, 4)
+	db, err := OpenDB(context.Background(), OpenConfig{Path: ":memory:", Attach: attaches})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			var n int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM db0.items i JOIN db1.t x ON 1=1`).Scan(&n); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkClusterWriteParallel(b *testing.B) {
+	attaches, main := benchAttachFiles(b, 3)
+	cluster, err := OpenCluster(context.Background(), attaches,
+		[]string{"db0", "db1", "db2"},
+		Profile{BatchSize: 128, BatchTimeout: time.Millisecond})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cluster.Close()
+	_ = main
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := cluster.WriteStmt(context.Background(), "db1",
+				`INSERT INTO db1.t (label) VALUES ('x')`, nil, false); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkClusterQueryCachedHit(b *testing.B) {
+	attaches, _ := benchAttachFiles(b, 3)
+	cluster, err := OpenCluster(context.Background(), attaches,
+		[]string{"db0", "db1", "db2"},
+		Profile{CacheTTL: time.Minute, CacheMax: 64})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cluster.Close()
+
+	ctx := context.Background()
+	if _, err := cluster.QueryCached(ctx, `SELECT id, label FROM db0.items`, nil); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := cluster.QueryCached(ctx, `SELECT id, label FROM db0.items`, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -467,6 +468,21 @@ func (m *Engine) cleanup() {
 
 // Cluster is what handlers and templates run against.
 func (m *Engine) Cluster() *database.Cluster { return m.cluster }
+
+// CanonicalSchema resolves a schema name to the declared spelling, matching the
+// way SQLite compares schema names: case-insensitively. The scratch schema is
+// always available, whatever its case.
+func (m *Engine) CanonicalSchema(name string) (string, bool) {
+	if strings.EqualFold(name, database.ScratchSchema) {
+		return database.ScratchSchema, true
+	}
+	for _, cfg := range m.dbs {
+		if strings.EqualFold(cfg.Name, name) {
+			return cfg.Name, true
+		}
+	}
+	return "", false
+}
 
 // DBConfig returns the declaration for a schema.
 func (m *Engine) DBConfig(name string) (*DBConfig, bool) {

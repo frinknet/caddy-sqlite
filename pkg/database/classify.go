@@ -109,6 +109,39 @@ func stripComments(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// NamedPlaceholders returns the named bind parameters a statement references
+// (:name, @name or $name), ignoring anything inside comments, string literals or
+// quoted identifiers. The plugin uses it to compare the SQL against the declared
+// bind names at provision, so a typo is a config error instead of a per-request
+// `missing named argument`.
+func NamedPlaceholders(sqlText string) []string {
+	s := stripComments(sqlText)
+	s = stripLiterals(s)
+
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range namedPlaceholderRe.FindAllStringSubmatch(s, -1) {
+		if seen[m[1]] {
+			continue
+		}
+		seen[m[1]] = true
+		out = append(out, m[1])
+	}
+	return out
+}
+
+var (
+	namedPlaceholderRe = regexp.MustCompile(`[:@$]([A-Za-z_][A-Za-z0-9_]*)`)
+	literalRe          = regexp.MustCompile(`'(?:[^']|'')*'|"(?:[^"]|"")*"`)
+)
+
+// stripLiterals blanks out quoted spans so a placeholder-looking sequence inside
+// a string ('at 12:30') or a quoted identifier ("weird:name") is not mistaken
+// for a bind.
+func stripLiterals(s string) string {
+	return literalRe.ReplaceAllString(s, "''")
+}
+
 var (
 	insertTargetRe = regexp.MustCompile(`(?is)\b(?:INSERT|REPLACE)\s+(?:OR\s+\w+\s+)?INTO\s+([^\s(,]+)`)
 	updateTargetRe = regexp.MustCompile(`(?is)\bUPDATE\s+(?:OR\s+\w+\s+)?([^\s(,]+)`)

@@ -162,12 +162,18 @@ func (m *SQLite) Provision(ctx caddy.Context) error {
 		if err != nil {
 			return err
 		}
-		m.schema = schema
-		if schema != database.ScratchSchema && !engine.Cluster().Writable(schema) {
-			if cfg, ok := engine.DBConfig(schema); ok && cfg.ReadOnly {
-				return fmt.Errorf("sqlite: cannot write to read-only database %q", schema)
-			}
+		// SQLite resolves schema names case-insensitively, so `INSERT INTO
+		// "APP".t` is valid SQL and must route to the declared `app`.
+		canonical, ok := engine.CanonicalSchema(schema)
+		if !ok {
 			return fmt.Errorf("sqlite: unknown database %q: declare it with `db %s <file>`", schema, schema)
+		}
+		m.schema = canonical
+		if canonical != database.ScratchSchema && !engine.Cluster().Writable(canonical) {
+			if cfg, cfgOK := engine.DBConfig(canonical); cfgOK && cfg.ReadOnly {
+				return fmt.Errorf("sqlite: cannot write to read-only database %q", canonical)
+			}
+			return fmt.Errorf("sqlite: database %q is not writable", canonical)
 		}
 	}
 
@@ -237,8 +243,46 @@ func (m *SQLite) parseBinds() error {
 		if n := strings.Count(m.Query, "?"); n != len(m.Binds) {
 			return fmt.Errorf("sqlite: %d '?' in sql but %d positional binds", n, len(m.Binds))
 		}
+	} else if len(m.Binds) > 0 {
+		return validateNamedBinds(m.Query, m.Binds)
 	}
 	return nil
+}
+
+// validateNamedBinds compares the statement's named placeholders with the
+// declared binds. Both mismatches are operator mistakes: a placeholder with no
+// bind fails every request (`missing named argument`), and a bind with no
+// placeholder is dead config that reads as if it did something.
+func validateNamedBinds(sqlText string, binds []Bind) error {
+	declared := map[string]bool{}
+	for _, b := range binds {
+		declared[b.Name] = true
+	}
+
+	used := database.NamedPlaceholders(sqlText)
+	if len(used) == 0 {
+		return fmt.Errorf("sqlite: named binds declared but the sql uses no :name, @name or $name placeholder")
+	}
+	for _, name := range used {
+		if !declared[name] {
+			return fmt.Errorf("sqlite: sql uses :%s but no bind declares it", name)
+		}
+	}
+	for _, b := range binds {
+		if !contains(used, b.Name) {
+			return fmt.Errorf("sqlite: bind %q is never used by the sql", b.Name)
+		}
+	}
+	return nil
+}
+
+func contains(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func checkPlan(plan database.Plan, output string) error {

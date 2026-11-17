@@ -139,6 +139,16 @@ import /data/snippets/rest.caddyfile
 	}
 
 	# Named binds
+	# SQLite schema names are case-insensitive; the module resolves them to the
+	# declared spelling.
+	route /case-insert {
+		sqlite {
+			query  "INSERT INTO E2E.items (label) VALUES (json_extract(?, '$.label'))"
+			bind   1 {http.request.body}
+			output json
+		}
+	}
+
 	route /named-insert {
 		sqlite {
 			query  "INSERT INTO e2e.items (label, tag_id) VALUES (json_extract(:body, '$.label'), :tag) RETURNING id, label"
@@ -376,6 +386,12 @@ RESP=$(curl -sS -o /tmp/e2e-named.json -w '%{http_code}' -X POST \
 check "named insert returns 201" '201' "$RESP"
 check "named insert body" '"named"' "$(cat /tmp/e2e-named.json)"
 rm -f /tmp/e2e-named.json
+
+# ── Test 4b: case-insensitive schema ───────────────────
+RESP=$(curl -sf -X POST -d '{"label":"cased"}' http://127.0.0.1:$PORT/case-insert)
+check "case-variant schema writes" '"affected":1' "$RESP"
+RESP=$(curl -sf http://127.0.0.1:$PORT/items)
+check "row landed in the declared schema" '"cased"' "$RESP"
 
 # ── Test 5: cross-schema join ──────────────────────────
 echo ""
@@ -635,6 +651,44 @@ cat > "$TMP/neg-readonly-backup.Caddyfile" << 'CADDY'
 }
 CADDY
 
+cat > "$TMP/neg-bind-missing.Caddyfile" << 'CADDY'
+{
+	admin off
+	sqlite {
+		db app /data/test.db
+	}
+}
+:8080 {
+	route /x {
+		sqlite {
+			query "UPDATE app.items SET label = :label WHERE id = :id"
+			bind  label {http.request.body}
+			output json
+		}
+	}
+}
+CADDY
+
+cat > "$TMP/neg-bind-unused.Caddyfile" << 'CADDY'
+{
+	admin off
+	sqlite {
+		db app /data/test.db
+	}
+}
+:8080 {
+	route /x {
+		sqlite {
+			query "UPDATE app.items SET label = :label WHERE id = :id"
+			bind  label {http.request.body}
+			bind  id    {http.request.uri.query.id}
+			bind  extra {http.request.uri.query.extra}
+			output json
+		}
+	}
+}
+CADDY
+
 cat > "$TMP/neg-use.Caddyfile" << 'CADDY'
 {
 	admin off
@@ -705,6 +759,8 @@ neg "unknown schema fails" "$TMP/neg-unknown-schema.Caddyfile" 'unknown database
 neg "write naming two schemas fails" "$TMP/neg-two-schemas.Caddyfile" 'one schema'
 neg "readonly + backup fails" "$TMP/neg-readonly-backup.Caddyfile" 'cannot be used with read_only'
 neg "use is gone" "$TMP/neg-use.Caddyfile" 'unknown option'
+neg "placeholder with no bind fails" "$TMP/neg-bind-missing.Caddyfile" 'no bind declares it'
+neg "unused bind fails" "$TMP/neg-bind-unused.Caddyfile" 'never used by the sql'
 neg "missing env var fails" "$TMP/neg-env.Caddyfile" 'CADDYSQLITE_E2E_UNSET'
 neg "unsupported backup method fails" "$TMP/neg-method.Caddyfile" 'unsupported method'
 neg "continue with output fails" "$TMP/neg-continue-output.Caddyfile" 'cannot be combined with output'

@@ -279,3 +279,118 @@ func TestPoolSharesAndReopensByPath(t *testing.T) {
 	}
 	pool.Release(path)
 }
+
+func benchmarkDB(b *testing.B, profile Profile) *DB {
+	b.Helper()
+	pool := NewPool()
+	path := filepath.Join(b.TempDir(), "bench.db")
+	db, err := pool.Acquire(context.Background(), path, profile)
+	if err != nil {
+		b.Fatalf("acquire: %v", err)
+	}
+	b.Cleanup(func() { pool.Release(path) })
+	return db
+}
+
+func BenchmarkQueryCachedHit(b *testing.B) {
+	db := benchmarkDB(b, Profile{CacheTTL: time.Minute, CacheMax: 64})
+	if _, err := db.SQL().Exec(`CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT)`); err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if _, err := db.SQL().Exec(`INSERT INTO items (label) VALUES (?)`, "row"); err != nil {
+			b.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+	if _, err := db.QueryCached(ctx, `SELECT id, label FROM items`, nil); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := db.QueryCached(ctx, `SELECT id, label FROM items`, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryDirect(b *testing.B) {
+	db := benchmarkDB(b, Profile{})
+	if _, err := db.SQL().Exec(`CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT)`); err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if _, err := db.SQL().Exec(`INSERT INTO items (label) VALUES (?)`, "row"); err != nil {
+			b.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, err := db.QueryDirect(ctx, `SELECT id, label FROM items`, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(rows) != 50 {
+			b.Fatalf("rows = %d", len(rows))
+		}
+	}
+}
+
+func BenchmarkQueryCachedLargeResultSkipsCache(b *testing.B) {
+	db := benchmarkDB(b, Profile{CacheTTL: time.Minute, CacheMax: 64})
+	if _, err := db.SQL().Exec(`CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT)`); err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < 101; i++ {
+		if _, err := db.SQL().Exec(`INSERT INTO items (label) VALUES (?)`, "row"); err != nil {
+			b.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, err := db.QueryCached(ctx, `SELECT id, label FROM items`, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(rows) != 101 {
+			b.Fatalf("rows = %d", len(rows))
+		}
+	}
+}
+
+func TestWriteStmtWithoutBatcherBypassesAndBumpsGen(t *testing.T) {
+	db := newBatchedDB(t, Profile{})
+	if db.batcher != nil {
+		t.Fatal("BatchSize 0 must not start a batcher")
+	}
+	if _, err := db.SQL().Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	res, err := db.WriteStmt(context.Background(), `INSERT INTO t (v) VALUES (?)`, []any{"direct"}, false)
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if res.Affected != 1 {
+		t.Fatalf("affected = %d, want 1", res.Affected)
+	}
+	if got := db.gen.Load(); got != 1 {
+		t.Fatalf("generation = %d, want 1", got)
+	}
+
+	rows, err := db.WriteStmt(context.Background(), `INSERT INTO t (v) VALUES ('r') RETURNING id`, nil, true)
+	if err != nil {
+		t.Fatalf("returning write: %v", err)
+	}
+	if !rows.HasRows || len(rows.Rows) != 1 {
+		t.Fatalf("want returned row, got %+v", rows)
+	}
+	if got := db.gen.Load(); got != 2 {
+		t.Fatalf("generation = %d, want 2", got)
+	}
+}

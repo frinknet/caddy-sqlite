@@ -83,3 +83,33 @@ func TestLRUZeroMaxDefaults(t *testing.T) {
 		t.Fatal("expected hit on default-sized cache")
 	}
 }
+
+func BenchmarkLRUGetHit(b *testing.B) {
+	c := New(1024)
+	c.Put(1, "value", time.Minute)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, ok := c.Get(1); !ok {
+			b.Fatal("miss")
+		}
+	}
+}
+
+func BenchmarkLRUGetMiss(b *testing.B) {
+	c := New(1024)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, ok := c.Get(1); ok {
+			b.Fatal("hit")
+		}
+	}
+}
+
+func BenchmarkLRUPutEvicting(b *testing.B) {
+	c := New(64)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		c.Put(uint64(i), "value", time.Minute)
+	}
+}

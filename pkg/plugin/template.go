@@ -73,7 +73,11 @@ func (m *SQLiteTemplateFuncs) query(sqlText string, args ...any) (any, error) {
 		if schema == "" {
 			return nil, fmt.Errorf("sqlite: writes must name a schema (use `main.` for the in-memory scratch)")
 		}
-		res, err := cluster.WriteStmt(context.Background(), schema, sqlText, args, plan.ReturnsRows)
+		canonical, ok := m.engine.CanonicalSchema(schema)
+		if !ok {
+			return nil, fmt.Errorf("sqlite: unknown database %q", schema)
+		}
+		res, err := cluster.WriteStmt(context.Background(), canonical, sqlText, args, plan.ReturnsRows)
 		if err != nil {
 			return nil, err
 		}

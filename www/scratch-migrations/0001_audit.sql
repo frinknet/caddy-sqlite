@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS audit (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL,
+    at   TEXT NOT NULL DEFAULT (datetime('now'))
+);

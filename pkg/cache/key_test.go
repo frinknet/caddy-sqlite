@@ -2,6 +2,9 @@ package cache
 
 import "testing"
 
+// Regression guard: args are length-delimited, so [a, b] cannot collide with
+// a single arg that happens to contain the same bytes.
+
 func TestKeyStable(t *testing.T) {
 	k1 := Key(1, "SELECT", []any{"x", int64(42)})
 	k2 := Key(1, "SELECT", []any{"x", int64(42)})
@@ -42,12 +45,25 @@ func TestKeyTypeSensitive(t *testing.T) {
 	}
 }
 
-// Regression guard: args are length-delimited, so [a, b] cannot collide with
-// a single arg that happens to contain the same bytes.
 func TestKeyArgsBoundary(t *testing.T) {
 	k1 := Key(1, "SELECT", []any{"a", "b"})
 	k2 := Key(1, "SELECT", []any{"astring:b"})
 	if k1 == k2 {
 		t.Fatal("cache key collision between [a,b] and [astring:b]")
+	}
+}
+
+func BenchmarkKey(b *testing.B) {
+	args := []any{"label", int64(42), "x"}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		Key(1, `SELECT id FROM items WHERE label = ? AND id = ? AND note = ?`, args)
+	}
+}
+
+func BenchmarkKeyNoArgs(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		Key(1, `SELECT COUNT(*) FROM items`, nil)
 	}
 }
