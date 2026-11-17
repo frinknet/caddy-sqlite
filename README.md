@@ -1,5 +1,7 @@
 # **One binary, one config, one database... DONE!**
 
+[![ci](https://github.com/frinknet/caddy-sqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/frinknet/caddy-sqlite/actions/workflows/ci.yml)
+
 A Caddy v2 plugin that exposes SQLite as a first-class backend: one statement per
 route, batched writes, a shared query cache, versioned migrations, scheduled
 backups, and cross-schema joins — all from the Caddyfile, with no SQL
