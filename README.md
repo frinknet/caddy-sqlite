@@ -63,7 +63,7 @@ Declares a database. Multiple allowed. Each declaration opens one `*sql.DB`, sha
         cache_ttl     <duration>  # default 5s; 0 disables
         cache_max     <int>       # default 1000
         migrate <dir>             # directory of NNNN_*.sql files
-        read_only                 # opens mode=ro; skips probe, batcher, migrate, backup
+        read_only                 # opens mode=ro; skips probe and batcher
         backup { ... }
         optimize <duration>       # e.g. 24h
     }
@@ -77,7 +77,7 @@ Declares a database. Multiple allowed. Each declaration opens one `*sql.DB`, sha
 | `cache_ttl` | duration | `5s` | Shared query cache TTL. `0` disables. |
 | `cache_max` | int | `1000` | Max entries in the DB's cache. |
 | `migrate <dir>` | — | disabled | Required arg. Reads `.sql` files from `<dir>` at startup. |
-| `read_only` | flag | false | `mode=ro`; skips probe, batcher, migrate, backup. |
+| `read_only` | flag | false | `mode=ro`; skips probe and batcher. Cannot be combined with `migrate`, `backup`, or `optimize` — each errors at provision. |
 | `backup` | block | — | Scheduled online backup. |
 | `optimize <dur>` | duration | disabled | Runs `PRAGMA optimize` on the writer at the given interval. |
 
@@ -162,7 +162,9 @@ Rejected. The first bind's name shape determines the mode; a bind of the wrong s
 
 ### Values
 
-Each bind value is a Caddy placeholder template, resolved with `repl.ReplaceAll(tmpl, "")` at request time. Unresolved placeholders return `400` naming the offending bind — that's an operator error (a `vars` line that never ran), so the client gets told.
+Each bind value is a Caddy placeholder template. At request time every `{...}` in the template is looked up in the replacer first: an unknown placeholder returns `400` naming the offending bind (a `vars` line that never ran, or a typo) instead of silently binding an empty string. Known placeholders are then substituted with `repl.ReplaceAll(tmpl, "")`.
+
+Because the check inspects the template rather than the result, a body that happens to contain braces binds fine: `bind 1 {http.request.body}` with `{"label":"x"}` passes the raw JSON through to SQLite — use `json_extract(?, '$.label')` in the query if you want the field.
 
 **All resolved values are strings.** SQLite applies type affinity to string-bound parameters. Cast in SQL when type matters: `CAST(? AS INTEGER)`, `strftime(?, ...)`. This is not a limitation — it's what "no SQL interpolation" means. The value you bind is the value SQLite sees.
 
@@ -177,14 +179,14 @@ Set with `output`. Default `json`.
 ```json
 {"status": "ok", "data": {"rows": [...]}}
 {"status": "ok", "data": {"affected": 1}}
-{"status": "error", "message": "unresolved bind 2: {json.email}"}
+{"status": "error", "message": "unresolved bind \"2\": {json.email}"}
 ```
 
 ### `xml`
 
 ```xml
 <response status="ok"><rows><row><id>1</id></row></rows></response>
-<error><message>unresolved bind 2: {json.email}</message></error>
+<error><message>unresolved bind "2": {json.email}</message></error>
 ```
 
 ### `csv`
@@ -303,17 +305,18 @@ sqlite_db media /srv/media.db {
 
 | Option | Notes |
 |---|---|
-| `schedule` | Cron expression. Five fields: minute, hour, day-of-month, month, day-of-week. |
+| `method` | Optional; only `vacuum_into` is accepted. Anything else is rejected at parse time. |
+| `schedule` | Cron expression — five fields (minute, hour, day-of-month, month, day-of-week) or a descriptor: `@daily`, `@hourly`, `@every 1h`. Minimum interval is 1s. |
 | `dir` | Directory for backup files. Created if missing. |
 | `retain` | Number of most-recent backups to keep. `0` keeps all. |
 
-Each run writes `<name>-<timestamp>.db` in `dir`. **Does not overwrite an existing file** — unique name per run. Requires SQLite 3.27.0+.
+Each run writes `<name>-<timestamp>.db` in `dir`, where the timestamp is `YYYYMMDD-HHMMSS.mmm`. **Does not overwrite an existing file** — if two runs land in the same millisecond the second gets a numeric suffix, so a name is never reused. Requires SQLite 3.27.0+.
 
-**Schedule:** one goroutine per DB with a cron scheduler. Backups run on a dedicated connection, not through the batcher. A failed backup logs a warning and retries on the next tick; it does not affect the request path.
+**Schedule:** one goroutine per DB with a cron scheduler. The backup runs `VACUUM INTO` on its own connection, not through the batcher. A failed backup logs a warning and retries on the next tick; it does not affect the request path.
 
-**Retention:** `retain N` keeps the N most recent files matching `<name>-*.db` in `dir`, deleting older ones after a successful backup.
+**Retention:** `retain N` keeps the N most recent files matching `<name>-*.db` in `dir` (newest by modification time), deleting older ones after a successful backup.
 
-**Read-only DBs** skip the backup block — there is nothing to back up that isn't already static.
+**Read-only DBs** cannot be backed up: `backup` on a `read_only` DB is a config error at provision.
 
 **What this does not do:** it does not restore. Restoring is a file copy while Caddy is stopped. Backups are for recovery, not hot-standby.
 

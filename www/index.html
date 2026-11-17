@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>caddy-sqlite</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 2rem; font: 16px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         background: #101418; color: #e6edf3; }
+  main { max-width: 40rem; margin: 0 auto; }
+  h1 { font-size: 1.25rem; letter-spacing: .02em; }
+  p  { color: #8b949e; }
+  form { display: flex; gap: .5rem; margin: 1.5rem 0; }
+  input, button { font: inherit; padding: .5rem .75rem; border-radius: 6px; border: 1px solid #30363d;
+                  background: #161b22; color: inherit; }
+  input { flex: 1; }
+  button { cursor: pointer; background: #21262d; }
+  button:hover { background: #30363d; }
+  ul { list-style: none; padding: 0; }
+  li { padding: .5rem .75rem; border-bottom: 1px solid #21262d; }
+  li span { color: #8b949e; font-size: .8rem; margin-left: .5rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>caddy-sqlite</h1>
+  <p>SQLite embedded in the web server. This page is served from <code>/srv/www</code>;
+     the list below is a live query against <code>/var/lib/caddy/app.db</code>.</p>
+
+  <form id="add">
+    <input id="body" placeholder="a new note" autocomplete="off" required>
+    <button>Add</button>
+  </form>
+
+  <ul id="notes"></ul>
+</main>
+<script>
+const list = document.getElementById('notes');
+
+async function refresh() {
+  const rows = (await (await fetch('/api/notes')).json()).data.rows ?? [];
+  list.replaceChildren(...rows.map(r => {
+    const li = document.createElement('li');
+    li.append(r.body, Object.assign(document.createElement('span'), { textContent: r.created_at }));
+    return li;
+  }));
+}
+
+document.getElementById('add').addEventListener('submit', async e => {
+  e.preventDefault();
+  const body = document.getElementById('body');
+  await fetch('/api/notes/add', { method: 'POST', body: body.value });
+  body.value = '';
+  refresh();
+});
+
+refresh();
+</script>
+</body>
+</html>

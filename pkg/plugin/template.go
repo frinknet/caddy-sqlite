@@ -5,6 +5,7 @@ import (
 	"html/template"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 
 	"github.com/frinknet/caddy-sqlite/pkg/database"
 )
@@ -18,6 +19,17 @@ func (SQLiteTemplateFuncs) CaddyModule() caddy.ModuleInfo {
 		ID:  "http.handlers.templates.functions.sqlite",
 		New: func() caddy.Module { return new(SQLiteTemplateFuncs) },
 	}
+}
+
+func (SQLiteTemplateFuncs) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	d.Next()
+	if d.NextArg() {
+		return d.ArgErr()
+	}
+	if d.NextBlock(d.Nesting()) {
+		return d.Err("sqlite template function takes no options")
+	}
+	return nil
 }
 
 func (m *SQLiteTemplateFuncs) Provision(ctx caddy.Context) error {

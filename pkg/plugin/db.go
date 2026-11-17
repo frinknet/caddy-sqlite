@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -122,12 +123,16 @@ func ParseSQLiteDBOption(d *caddyfile.Dispenser, _ any) (any, error) {
 					if !d.NextArg() {
 						return nil, d.ArgErr()
 					}
+					if d.Val() != "vacuum_into" {
+						return nil, d.Errf("backup: unsupported method %q (only vacuum_into)", d.Val())
+					}
 					b.Method = d.Val()
 				case "schedule":
-					if !d.NextArg() {
+					args := d.RemainingArgs()
+					if len(args) == 0 {
 						return nil, d.ArgErr()
 					}
-					b.Schedule = d.Val()
+					b.Schedule = strings.Join(args, " ")
 				case "dir":
 					if !d.NextArg() {
 						return nil, d.ArgErr()
@@ -176,6 +181,10 @@ func (SQLiteDBs) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+func (m *SQLiteDBs) Start() error { return nil }
+
+func (m *SQLiteDBs) Stop() error { return nil }
+
 func (m *SQLiteDBs) Provision(ctx caddy.Context) (err error) {
 	m.log = ctx.Logger(m)
 	m.pool = database.NewPool()
@@ -189,7 +198,10 @@ func (m *SQLiteDBs) Provision(ctx caddy.Context) (err error) {
 
 	seen := map[string]string{}
 	for name, cfg := range cfgs {
-		p := expandEnv(cfg.Path)
+		p, perr := expandEnv(cfg.Path)
+		if perr != nil {
+			return fmt.Errorf("sqlite_db %q: %w", name, perr)
+		}
 		if other, ok := seen[p]; ok {
 			return fmt.Errorf("sqlite_db %q and %q both point to %q", name, other, p)
 		}
@@ -211,12 +223,22 @@ func (m *SQLiteDBs) Provision(ctx caddy.Context) (err error) {
 }
 
 func (m *SQLiteDBs) provisionOne(ctx caddy.Context, name string, cfg *DBConfig) error {
-	path := expandEnv(cfg.Path)
+	path, err := expandEnv(cfg.Path)
+	if err != nil {
+		return fmt.Errorf("sqlite_db %q: %w", name, err)
+	}
 	if path == "" {
 		return fmt.Errorf("sqlite_db %q: path resolved empty", name)
 	}
-	if cfg.ReadOnly && cfg.MigrateDir != "" {
-		return fmt.Errorf("sqlite_db %q: migrate cannot be used with read_only", name)
+	if cfg.ReadOnly {
+		switch {
+		case cfg.MigrateDir != "":
+			return fmt.Errorf("sqlite_db %q: migrate cannot be used with read_only", name)
+		case cfg.Optimize > 0:
+			return fmt.Errorf("sqlite_db %q: optimize cannot be used with read_only", name)
+		case cfg.Backup != nil:
+			return fmt.Errorf("sqlite_db %q: backup cannot be used with read_only", name)
+		}
 	}
 
 	profile := database.Profile{
@@ -256,7 +278,7 @@ func (m *SQLiteDBs) provisionOne(ctx caddy.Context, name string, cfg *DBConfig) 
 
 func (m *SQLiteDBs) cleanupAll() {
 	for _, cfg := range m.configs {
-		path := expandEnv(cfg.Path)
+		path, _ := expandEnv(cfg.Path)
 		for _, s := range m.stops[path] {
 			s()
 		}
@@ -271,17 +293,22 @@ func (m *SQLiteDBs) Cleanup() error {
 	return nil
 }
 
-func (m *SQLiteDBs) Lookup(nameOrPath string) (*database.DB, error) {
-	if cfg, ok := m.configs[nameOrPath]; ok {
-		return m.pool.Acquire(context.Background(), expandEnv(cfg.Path), database.Profile{
-			BatchSize:    cfg.BatchSize,
-			BatchTimeout: cfg.BatchTimeout,
-			CacheTTL:     cfg.CacheTTL,
-			CacheMax:     cfg.CacheMax,
-			ReadOnly:     cfg.ReadOnly,
-		})
+func (m *SQLiteDBs) Lookup(name string) (*database.DB, error) {
+	cfg, ok := m.configs[name]
+	if !ok {
+		return nil, fmt.Errorf("sqlite: unknown database %q: declare it with `sqlite_db %s <path>`", name, name)
 	}
-	return m.pool.Acquire(context.Background(), expandEnv(nameOrPath), database.Profile{})
+	path, err := expandEnv(cfg.Path)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite_db %q: %w", name, err)
+	}
+	return m.pool.Acquire(context.Background(), path, database.Profile{
+		BatchSize:    cfg.BatchSize,
+		BatchTimeout: cfg.BatchTimeout,
+		CacheTTL:     cfg.CacheTTL,
+		CacheMax:     cfg.CacheMax,
+		ReadOnly:     cfg.ReadOnly,
+	})
 }
 
 func runOptimize(stop chan struct{}, db *database.DB, every time.Duration, log *zap.Logger) {
@@ -301,14 +328,22 @@ func runOptimize(stop chan struct{}, db *database.DB, every time.Duration, log *
 
 var envRe = regexp.MustCompile(`\{env\.([A-Za-z_][A-Za-z0-9_]*)\}`)
 
-func expandEnv(s string) string {
-	return envRe.ReplaceAllStringFunc(s, func(m string) string {
+func expandEnv(s string) (string, error) {
+	var missing string
+	out := envRe.ReplaceAllStringFunc(s, func(m string) string {
 		name := m[5 : len(m)-1]
 		if v, ok := os.LookupEnv(name); ok {
 			return v
 		}
+		if missing == "" {
+			missing = name
+		}
 		return m
 	})
+	if missing != "" {
+		return "", fmt.Errorf("environment variable %q is not set", missing)
+	}
+	return out, nil
 }
 
 var (

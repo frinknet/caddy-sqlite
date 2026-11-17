@@ -1,0 +1,60 @@
+{
+	# The admin API stays enabled so the container HEALTHCHECK can poll
+	# /config/. Replace it with `admin off` if you drop the healthcheck.
+	admin localhost:2019
+
+	sqlite_db app /var/lib/caddy/app.db {
+		batch_size    128
+		batch_timeout 5ms
+		cache_ttl     5s
+		cache_max     1000
+		migrate       /srv/www/migrations
+		optimize      24h
+	}
+}
+
+:80 {
+	# Read: cached, served from the shared LRU for cache_ttl.
+	handle /api/notes {
+		sqlite_response {
+			use    app
+			query  "SELECT id, body, created_at FROM notes ORDER BY id DESC"
+			output json
+		}
+	}
+
+	# Write: rides the batcher, bumps the generation counter, so the read
+	# above is invalidated the moment the commit lands. Accepts either a
+	# JSON object with a "body" field or a raw text body.
+	handle /api/notes/add {
+		sqlite_response {
+			use    app
+			query  "INSERT INTO notes (body) VALUES (CASE WHEN json_valid(?) THEN COALESCE(json_extract(?, '$.body'), ?) ELSE ? END) RETURNING id, body, created_at"
+			bind   1 {http.request.body}
+			bind   2 {http.request.body}
+			bind   3 {http.request.body}
+			bind   4 {http.request.body}
+			output json
+			cache  0
+		}
+	}
+
+	handle /api/health {
+		sqlite_response {
+			use    app
+			query  "SELECT COUNT(*) AS notes FROM notes"
+			output json
+		}
+	}
+
+	# Schema files are not public.
+	handle /migrations/* {
+		respond "Not Found" 404
+	}
+
+	handle {
+		file_server {
+			root /srv/www
+		}
+	}
+}
