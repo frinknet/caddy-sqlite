@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"fmt"
 	"html/template"
 
 	"github.com/caddyserver/caddy/v2"
@@ -11,7 +12,7 @@ import (
 )
 
 type SQLiteTemplateFuncs struct {
-	app *SQLiteDBs
+	engine *Engine
 }
 
 func (SQLiteTemplateFuncs) CaddyModule() caddy.ModuleInfo {
@@ -37,7 +38,11 @@ func (m *SQLiteTemplateFuncs) Provision(ctx caddy.Context) error {
 	if err != nil {
 		return err
 	}
-	m.app = appIface.(*SQLiteDBs)
+	engine, ok := appIface.(*Engine)
+	if !ok {
+		return fmt.Errorf("sqlite: unexpected app type %T", appIface)
+	}
+	m.engine = engine
 	return nil
 }
 
@@ -47,24 +52,28 @@ func (m *SQLiteTemplateFuncs) CustomTemplateFunctions() template.FuncMap {
 	}
 }
 
-// query executes SQL and returns the resulting rows. Reads go through the
-// shared per-DB cache; writes go through the batcher and bump the generation
-// counter on commit, invalidating cached reads on the same DB. Non-RETURNING
-// writes return an empty slice so templates have something iterable.
-func (m *SQLiteTemplateFuncs) query(dbName, sqlText string, args ...any) (any, error) {
-	db, err := m.app.Lookup(dbName)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Release()
-
+// query executes SQL and returns the resulting rows. There is no database
+// argument: the schema named in the statement selects the data, because every
+// declared database is attached to the same pool. Reads share the cache with
+// handlers; writes route to the schema's batcher and bump the generation
+// counter. Non-RETURNING writes return an empty slice so templates always have
+// something iterable.
+func (m *SQLiteTemplateFuncs) query(sqlText string, args ...any) (any, error) {
+	cluster := m.engine.Cluster()
 	plan, err := database.Classify(sqlText)
 	if err != nil {
 		return nil, err
 	}
 
 	if plan.IsWrite {
-		res, err := db.WriteStmt(context.Background(), sqlText, args, plan.ReturnsRows)
+		schema, err := database.WriteTarget(sqlText)
+		if err != nil {
+			return nil, err
+		}
+		if schema == "" {
+			return nil, fmt.Errorf("sqlite: writes must name a schema (use `main.` for the in-memory scratch)")
+		}
+		res, err := cluster.WriteStmt(context.Background(), schema, sqlText, args, plan.ReturnsRows)
 		if err != nil {
 			return nil, err
 		}
@@ -74,7 +83,7 @@ func (m *SQLiteTemplateFuncs) query(dbName, sqlText string, args ...any) (any, e
 		return []map[string]any{}, nil
 	}
 
-	return db.QueryCached(context.Background(), sqlText, args)
+	return cluster.QueryCached(context.Background(), sqlText, args)
 }
 
 var (

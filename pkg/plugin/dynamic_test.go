@@ -32,7 +32,7 @@ func runDynamic(t *testing.T, db *sql.DB, query string) *httptest.ResponseRecord
 	}
 	defer rows.Close()
 
-	m := &SQLiteResponse{Output: "dynamic"}
+	m := &SQLite{Output: "dynamic"}
 	w := httptest.NewRecorder()
 	m.writeDynamic(w, rows, zap.NewNop())
 	return w
@@ -172,25 +172,25 @@ func TestWriteFailFormats(t *testing.T) {
 
 func TestWriteResultAffectedAndRows(t *testing.T) {
 	w := httptest.NewRecorder()
-	writeResult(w, "json", &database.BatchResult{Affected: 3})
+	writeResult(w, "json", http.StatusOK, &database.BatchResult{Affected: 3})
 	if !strings.Contains(w.Body.String(), `"affected":3`) {
 		t.Fatalf("json body = %s", w.Body.String())
 	}
 
 	w = httptest.NewRecorder()
-	writeResult(w, "xml", &database.BatchResult{Affected: 3})
+	writeResult(w, "xml", http.StatusOK, &database.BatchResult{Affected: 3})
 	if !strings.Contains(w.Body.String(), "<affected>3</affected>") {
 		t.Fatalf("xml body = %s", w.Body.String())
 	}
 
 	w = httptest.NewRecorder()
-	writeResult(w, "plain", &database.BatchResult{Affected: 3})
+	writeResult(w, "plain", http.StatusOK, &database.BatchResult{Affected: 3})
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("plain write result status = %d, want 500", w.Code)
 	}
 
 	w = httptest.NewRecorder()
-	writeResult(w, "json", &database.BatchResult{HasRows: true, Rows: []map[string]any{{"id": int64(1)}}})
+	writeResult(w, "json", http.StatusOK, &database.BatchResult{HasRows: true, Rows: []map[string]any{{"id": int64(1)}}})
 	if !strings.Contains(w.Body.String(), `"rows":[{"id":1}]`) {
 		t.Fatalf("returning body = %s", w.Body.String())
 	}
@@ -198,7 +198,7 @@ func TestWriteResultAffectedAndRows(t *testing.T) {
 
 func TestCSVRowsHeaderDataAndNils(t *testing.T) {
 	w := httptest.NewRecorder()
-	writeRows(w, "csv", []map[string]any{
+	writeRows(w, "csv", http.StatusOK, []map[string]any{
 		{"id": int64(1), "label": "first", "note": nil},
 		{"id": int64(2), "label": "second", "note": "x"},
 	})
@@ -211,7 +211,7 @@ func TestCSVRowsHeaderDataAndNils(t *testing.T) {
 
 func TestCSVRowsEmptyResultIsHeaderless(t *testing.T) {
 	w := httptest.NewRecorder()
-	writeRows(w, "csv", nil)
+	writeRows(w, "csv", http.StatusOK, nil)
 	if w.Body.Len() != 0 {
 		t.Fatalf("body = %q, want empty", w.Body.String())
 	}
@@ -222,7 +222,7 @@ func TestCSVRowsEmptyResultIsHeaderless(t *testing.T) {
 
 func TestPlainRowsLayout(t *testing.T) {
 	w := httptest.NewRecorder()
-	writeRows(w, "plain", []map[string]any{
+	writeRows(w, "plain", http.StatusOK, []map[string]any{
 		{"id": int64(1), "label": "first"},
 		{"id": int64(2), "label": "second"},
 	})
@@ -235,7 +235,7 @@ func TestPlainRowsLayout(t *testing.T) {
 
 func TestXMLRowsEscapesAndSanitizesTags(t *testing.T) {
 	w := httptest.NewRecorder()
-	writeRows(w, "xml", []map[string]any{{"a b": "<x>"}})
+	writeRows(w, "xml", http.StatusOK, []map[string]any{{"a b": "<x>"}})
 
 	got := w.Body.String()
 	if !strings.Contains(got, "<a_b>&lt;x&gt;</a_b>") {
@@ -246,7 +246,7 @@ func TestXMLRowsEscapesAndSanitizesTags(t *testing.T) {
 func TestWriteRowsUnknownFormat(t *testing.T) {
 	for _, format := range []string{"nonsense", ""} {
 		w := httptest.NewRecorder()
-		writeRows(w, format, []map[string]any{{"id": 1}})
+		writeRows(w, format, http.StatusOK, []map[string]any{{"id": 1}})
 		if w.Code != http.StatusInternalServerError {
 			t.Fatalf("format %q: status = %d, want 500", format, w.Code)
 		}

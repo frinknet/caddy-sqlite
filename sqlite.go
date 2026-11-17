@@ -12,15 +12,12 @@ func init() {
 		panic(err)
 	}
 
-	caddy.RegisterModule(plugin.SQLiteDBs{})
-	caddy.RegisterModule(plugin.SQLiteResponse{})
+	caddy.RegisterModule(plugin.Engine{})
+	caddy.RegisterModule(new(plugin.SQLite))
 	caddy.RegisterModule(plugin.SQLiteTemplateFuncs{})
-	caddy.RegisterModule(new(plugin.SQLiteBG))
 
-	httpcaddyfile.RegisterGlobalOption("sqlite_db", plugin.ParseSQLiteDBOption)
-	httpcaddyfile.RegisterHandlerDirective("sqlite_response", plugin.ParseResponse)
-	httpcaddyfile.RegisterHandlerDirective("sqlite_bg", plugin.ParseBG)
+	httpcaddyfile.RegisterGlobalOption("sqlite", plugin.ParseGlobalOption)
+	httpcaddyfile.RegisterHandlerDirective("sqlite", plugin.ParseHandler)
 
-	httpcaddyfile.RegisterDirectiveOrder("sqlite_response", "before", "respond")
-	httpcaddyfile.RegisterDirectiveOrder("sqlite_bg", "before", "respond")
+	httpcaddyfile.RegisterDirectiveOrder("sqlite", "before", "respond")
 }

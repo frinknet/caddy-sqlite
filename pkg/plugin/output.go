@@ -14,37 +14,37 @@ type response struct {
 	Message string `json:"message,omitempty"`
 }
 
-func writeRows(w http.ResponseWriter, format string, rows []map[string]any) {
+func writeRows(w http.ResponseWriter, format string, status int, rows []map[string]any) {
 	switch format {
 	case "json":
-		writeJSONRows(w, rows)
+		writeJSONRows(w, status, rows)
 	case "xml":
-		writeXMLRows(w, rows)
+		writeXMLRows(w, status, rows)
 	case "csv":
-		writeCSVRows(w, rows)
+		writeCSVRows(w, status, rows)
 	case "plain":
-		writePlainRows(w, rows)
+		writePlainRows(w, status, rows)
 	default:
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	}
 }
 
-func writeResult(w http.ResponseWriter, format string, res *database.BatchResult) {
+func writeResult(w http.ResponseWriter, format string, status int, res *database.BatchResult) {
 	if res.HasRows {
-		writeRows(w, format, res.Rows)
+		writeRows(w, format, status, res.Rows)
 		return
 	}
 	switch format {
 	case "json":
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(status)
 		json.NewEncoder(w).Encode(response{
 			Status: "ok",
 			Data:   map[string]any{"affected": res.Affected},
 		})
 	case "xml":
 		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(status)
 		fmt.Fprintf(w, "<response status=\"ok\"><affected>%d</affected></response>", res.Affected)
 	default:
 		http.Error(w, "internal error", http.StatusInternalServerError)

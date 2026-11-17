@@ -8,7 +8,12 @@ import (
 	"github.com/caddyserver/caddy/v2"
 )
 
-func (m *SQLiteResponse) resolveArgs(repl *caddy.Replacer) ([]any, error) {
+type Bind struct {
+	Name  string
+	Value string
+}
+
+func (m *SQLite) resolveArgs(repl *caddy.Replacer) ([]any, error) {
 	args := make([]any, len(m.Binds))
 	for i, b := range m.Binds {
 		if name, ok := unknownPlaceholder(repl, b.Value); ok {

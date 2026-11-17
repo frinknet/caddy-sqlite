@@ -19,6 +19,7 @@ type Profile struct {
 	CacheTTL     time.Duration
 	CacheMax     int
 	ReadOnly     bool
+	Timeout      time.Duration
 }
 
 type DB struct {

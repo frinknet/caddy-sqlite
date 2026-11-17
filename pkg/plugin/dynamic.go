@@ -7,7 +7,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func (m *SQLiteResponse) writeDynamic(w http.ResponseWriter, rows *sql.Rows, log *zap.Logger) {
+func (m *SQLite) writeDynamic(w http.ResponseWriter, rows *sql.Rows, log *zap.Logger) {
 	cols, err := rows.Columns()
 	if err != nil {
 		writeFail(w, http.StatusInternalServerError, m.Output, "internal error")

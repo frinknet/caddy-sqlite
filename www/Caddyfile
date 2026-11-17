@@ -3,46 +3,51 @@
 	# /config/. Replace it with `admin off` if you drop the healthcheck.
 	admin localhost:2019
 
-	sqlite_db app /var/lib/caddy/app.db {
+	sqlite {
+		# Engine-wide: one read pool, one cache, one write-batching policy.
 		batch_size    128
 		batch_timeout 5ms
 		cache_ttl     5s
 		cache_max     1000
-		migrate       /srv/www/migrations
-		optimize      24h
+		timeout       30s
+
+		# Declaring a database attaches it as a schema. Queries address it as
+		# app.notes; unqualified names hit the in-memory scratch (main.*).
+		db app /var/lib/caddy/app.db {
+			migrate  /srv/www/migrations
+			optimize 24h
+		}
 	}
 }
 
 :80 {
-	# Read: cached, served from the shared LRU for cache_ttl.
+	# Read: cached, served from the shared LRU for cache_ttl. A write anywhere
+	# bumps the generation counter, which invalidates it.
 	handle /api/notes {
-		sqlite_response {
-			use    app
-			query  "SELECT id, body, created_at FROM notes ORDER BY id DESC"
+		sqlite {
+			query  "SELECT id, body, created_at FROM app.notes ORDER BY id DESC"
 			output json
 		}
 	}
 
-	# Write: rides the batcher, bumps the generation counter, so the read
-	# above is invalidated the moment the commit lands. Accepts either a
-	# JSON object with a "body" field or a raw text body.
+	# Write: rides app's batcher and bumps the generation counter on commit.
+	# Accepts either a JSON object with a "body" field or a raw text body.
 	handle /api/notes/add {
-		sqlite_response {
-			use    app
-			query  "INSERT INTO notes (body) VALUES (CASE WHEN json_valid(?) THEN COALESCE(json_extract(?, '$.body'), ?) ELSE ? END) RETURNING id, body, created_at"
-			bind   1 {http.request.body}
-			bind   2 {http.request.body}
-			bind   3 {http.request.body}
-			bind   4 {http.request.body}
+		sqlite {
+			query  "INSERT INTO app.notes (body) VALUES (
+			            CASE WHEN json_valid(:body)
+			                 THEN COALESCE(json_extract(:body, '$.body'), :body)
+			                 ELSE :body END
+			        ) RETURNING id, body, created_at"
+			bind   body {http.request.body}
 			output json
-			cache  0
+			status 201
 		}
 	}
 
 	handle /api/health {
-		sqlite_response {
-			use    app
-			query  "SELECT COUNT(*) AS notes FROM notes"
+		sqlite {
+			query  "SELECT COUNT(*) AS notes FROM app.notes"
 			output json
 		}
 	}

@@ -1,0 +1,99 @@
+# Reusable REST CRUD for one resource, built on the `sqlite` handler.
+#
+# The snippet is defined at the top level, outside any site block:
+#   import snippets/rest.caddyfile
+# Then, inside a site block:
+#   import rest notes  app.notes    body
+#   import rest assets media.assets name
+#
+# Arguments:
+#   {args[0]}  resource name: the path segment, the matcher suffix, and the
+#              path_regexp name (so the id is {re.{args[0]}.id})
+#   {args[1]}  schema.table
+#   {args[2]}  text column exposed as "body"
+#
+# The caller must declare the method matchers once per site. Matcher names are
+# unique per site, so a snippet cannot define them (importing it twice would be
+# a duplicate-definition error):
+#
+#   @get    method GET
+#   @post   method POST
+#   @put    method PUT
+#   @patch  method PATCH
+#   @delete method DELETE
+#
+# {args[N]} is substituted textually when the Caddyfile is read, so it may name
+# tables and columns. Request data never reaches SQL that way: it arrives as a
+# bind, which the driver passes as a parameter.
+(rest) {
+	@list_{args[0]} path /api/{args[0]}
+	@item_{args[0]} path_regexp {args[0]} ^/api/{args[0]}/(?P<id>[0-9]+)$
+
+	handle @list_{args[0]} {
+		handle @get {
+			sqlite {
+				query  "SELECT id, {args[2]} AS body, created_at
+				        FROM {args[1]} ORDER BY id DESC"
+				output json
+			}
+		}
+		handle @post {
+			sqlite {
+				query  "INSERT INTO {args[1]} ({args[2]})
+				        VALUES (json_extract(:body, '$.{args[2]}'))
+				        RETURNING id, {args[2]} AS body, created_at"
+				bind   body {http.request.body}
+				output json
+				status 201
+			}
+		}
+		respond "method not allowed" 405
+	}
+
+	handle @item_{args[0]} {
+		handle @get {
+			sqlite {
+				query  "SELECT CASE WHEN id IS NULL
+				                  THEN json_object('error', 'not found')
+				                  ELSE json_object('id', id, '{args[2]}', {args[2]}, 'created_at', created_at)
+				             END AS content,
+				             'application/json' AS content_type,
+				             CASE WHEN id IS NULL THEN 404 ELSE 200 END AS http_code
+				        FROM (SELECT id, {args[2]}, created_at FROM {args[1]} WHERE id = :id
+				              UNION ALL SELECT NULL, NULL, NULL LIMIT 1)"
+				bind   id {re.{args[0]}.id}
+				output dynamic
+			}
+		}
+		handle @put {
+			sqlite {
+				query  "UPDATE {args[1]} SET {args[2]} = json_extract(:body, '$.{args[2]}')
+				        WHERE id = :id
+				        RETURNING id, {args[2]} AS body, created_at"
+				bind   id   {re.{args[0]}.id}
+				bind   body {http.request.body}
+				output json
+			}
+		}
+		handle @patch {
+			sqlite {
+				query  "UPDATE {args[1]}
+				        SET {args[2]} = COALESCE(json_extract(:body, '$.{args[2]}'), {args[2]})
+				        WHERE id = :id
+				        RETURNING id, {args[2]} AS body, created_at"
+				bind   id   {re.{args[0]}.id}
+				bind   body {http.request.body}
+				output json
+			}
+		}
+		handle @delete {
+			sqlite {
+				query  "DELETE FROM {args[1]} WHERE id = :id"
+				bind   id {re.{args[0]}.id}
+				output none
+				status 204
+			}
+		}
+		respond "method not allowed" 405
+	}
+}

@@ -2,51 +2,20 @@ package plugin
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/frinknet/caddy-sqlite/pkg/database"
 )
 
-func newTemplateFuncs(t *testing.T) (*SQLiteTemplateFuncs, *database.DB) {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "tpl.db")
-	profile := database.Profile{BatchSize: 4, BatchTimeout: 5 * time.Millisecond, CacheTTL: time.Minute, CacheMax: 8}
-
-	pool := database.NewPool()
-	db, err := pool.Acquire(context.Background(), path, profile)
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if _, err := db.SQL().Exec(`CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT)`); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	t.Cleanup(func() { pool.Release(path) })
-
-	app := &SQLiteDBs{
-		configs: map[string]*DBConfig{
-			"t": {
-				Name:         "t",
-				Path:         path,
-				BatchSize:    profile.BatchSize,
-				BatchTimeout: profile.BatchTimeout,
-				CacheTTL:     profile.CacheTTL,
-				CacheMax:     profile.CacheMax,
-			},
-		},
-		pool: pool,
-	}
-	return &SQLiteTemplateFuncs{app: app}, db
-}
-
 func TestTemplateQueryReads(t *testing.T) {
-	m, db := newTemplateFuncs(t)
-	if _, err := db.SQL().Exec(`INSERT INTO items (label) VALUES ('first'), ('second')`); err != nil {
+	engine := newTestEngine(t, testProfile())
+	m := &SQLiteTemplateFuncs{engine: engine}
+
+	if _, err := engine.Cluster().WriteStmt(context.Background(), "app",
+		`INSERT INTO app.notes (body) VALUES ('first'), ('second')`, nil, false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
-	got, err := m.query("t", `SELECT id, label FROM items ORDER BY id`)
+	got, err := m.query(`SELECT id, body FROM app.notes ORDER BY id`)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -54,15 +23,57 @@ func TestTemplateQueryReads(t *testing.T) {
 	if !ok {
 		t.Fatalf("query returned %T, want []map[string]any", got)
 	}
-	if len(rows) != 2 || rows[0]["label"] != "first" {
+	if len(rows) != 2 || rows[0]["body"] != "first" {
 		t.Fatalf("rows = %+v", rows)
 	}
 }
 
-func TestTemplateQueryWriteBumpsGenerationAndUncachesReads(t *testing.T) {
-	m, _ := newTemplateFuncs(t)
+func TestTemplateQueryJoinsAcrossSchemas(t *testing.T) {
+	engine := newTestEngine(t, testProfile())
+	m := &SQLiteTemplateFuncs{engine: engine}
+	ctx := context.Background()
 
-	before, err := m.query("t", `SELECT COUNT(*) AS n FROM items`)
+	if _, err := engine.Cluster().WriteStmt(ctx, "media", `INSERT INTO media.assets (name) VALUES ('logo')`, nil, false); err != nil {
+		t.Fatalf("seed media: %v", err)
+	}
+	if _, err := engine.Cluster().WriteStmt(ctx, "app",
+		`INSERT INTO app.notes (body, asset_id) VALUES ('hello', 1)`, nil, false); err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+
+	got, err := m.query(`SELECT n.body, m.name AS asset FROM app.notes n JOIN media.assets m ON m.id = n.asset_id`)
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	rows := got.([]map[string]any)
+	if len(rows) != 1 || rows[0]["asset"] != "logo" {
+		t.Fatalf("rows = %+v", rows)
+	}
+}
+
+func TestTemplateQueryPositionalArgs(t *testing.T) {
+	engine := newTestEngine(t, testProfile())
+	m := &SQLiteTemplateFuncs{engine: engine}
+
+	if _, err := engine.Cluster().WriteStmt(context.Background(), "app",
+		`INSERT INTO app.notes (body) VALUES ('one'), ('two')`, nil, false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	got, err := m.query(`SELECT body FROM app.notes WHERE id = ?`, int64(2))
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	rows := got.([]map[string]any)
+	if len(rows) != 1 || rows[0]["body"] != "two" {
+		t.Fatalf("rows = %+v", rows)
+	}
+}
+
+func TestTemplateQueryWriteInvalidatesCache(t *testing.T) {
+	engine := newTestEngine(t, testProfile())
+	m := &SQLiteTemplateFuncs{engine: engine}
+	before, err := m.query(`SELECT COUNT(*) AS n FROM app.notes`)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -70,17 +81,18 @@ func TestTemplateQueryWriteBumpsGenerationAndUncachesReads(t *testing.T) {
 		t.Fatalf("n = %v, want 0", n)
 	}
 
-	out, err := m.query("t", `INSERT INTO items (label) VALUES ('tpl')`)
+	out, err := m.query(`INSERT INTO app.notes (body) VALUES ('tpl')`)
 	if err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	if rows, ok := out.([]map[string]any); !ok || len(rows) != 0 {
 		t.Fatalf("non-RETURNING write returned %#v, want an empty slice", out)
 	}
+	if got := engine.Cluster().Gen(); got == 0 {
+		t.Fatal("a template write must bump the generation counter")
+	}
 
-	// The read above was cached (one row learned from a :=100 row result), so
-	// seeing the new row here proves the write moved the generation counter.
-	after, err := m.query("t", `SELECT COUNT(*) AS n FROM items`)
+	after, err := m.query(`SELECT COUNT(*) AS n FROM app.notes`)
 	if err != nil {
 		t.Fatalf("read after write: %v", err)
 	}
@@ -89,48 +101,41 @@ func TestTemplateQueryWriteBumpsGenerationAndUncachesReads(t *testing.T) {
 	}
 }
 
-func TestTemplateQueryWriteWithReturning(t *testing.T) {
-	m, _ := newTemplateFuncs(t)
+func TestTemplateQueryWriteNeedsSchema(t *testing.T) {
+	engine := newTestEngine(t, testProfile())
+	m := &SQLiteTemplateFuncs{engine: engine}
 
-	out, err := m.query("t", `INSERT INTO items (label) VALUES ('ret') RETURNING id, label`)
-	if err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	rows, ok := out.([]map[string]any)
-	if !ok || len(rows) != 1 || rows[0]["label"] != "ret" {
-		t.Fatalf("returned %#v", out)
+	if _, err := m.query(`INSERT INTO notes (body) VALUES ('x')`); err == nil {
+		t.Fatal("an unqualified write must fail")
 	}
 }
 
 func TestTemplateQueryRejectsBadInput(t *testing.T) {
-	m, _ := newTemplateFuncs(t)
+	engine := newTestEngine(t, testProfile())
+	m := &SQLiteTemplateFuncs{engine: engine}
 
-	if _, err := m.query("nope", `SELECT 1`); err == nil {
-		t.Fatal("expected an unknown database to fail")
-	}
-	if _, err := m.query("t", `NOT SQL AT ALL`); err == nil {
+	if _, err := m.query(`NOT SQL AT ALL`); err == nil {
 		t.Fatal("expected an unclassifiable statement to fail")
+	}
+	if _, err := m.query(`SELECT 1 FROM app.no_such_table`); err == nil {
+		t.Fatal("expected a missing table to fail")
+	}
+	if _, err := m.query(`INSERT INTO nope.t (x) VALUES (1)`); err == nil {
+		t.Fatal("expected an unknown schema to fail")
 	}
 }
 
 func TestRunOptimizeStopsOnSignal(t *testing.T) {
-	pool := database.NewPool()
-	path := filepath.Join(t.TempDir(), "opt.db")
-	db, err := pool.Acquire(context.Background(), path, database.Profile{})
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	defer pool.Release(path)
-
+	engine := newTestEngine(t, testProfile())
 	stop := make(chan struct{})
 	done := make(chan struct{})
-	stopAt := time.Now().Add(30 * time.Millisecond)
+
 	go func() {
-		runOptimize(stop, db, 5*time.Millisecond, nil)
+		runOptimize(stop, engine.Cluster().Anchor(), 5*time.Millisecond, nil)
 		close(done)
 	}()
 
-	time.Sleep(time.Until(stopAt))
+	time.Sleep(30 * time.Millisecond)
 	close(stop)
 
 	select {

@@ -23,34 +23,46 @@ RUN case "${TARGETARCH}" in \
 WORKDIR /build
 COPY . /src/caddy-sqlite
 
+# The Caddy version is pinned so the image cannot drift away from what the
+# tests run against. Dependency versions are recorded in /out/versions.txt,
+# which ships in the image: compare it with go.mod when something behaves
+# differently in the container than it does under `go test`.
+ARG CADDY_VERSION=v2.11.9
+
 RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
     --mount=type=cache,id=gobuild,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux \
-    xcaddy build \
+    xcaddy build "${CADDY_VERSION}" \
     --with github.com/frinknet/caddy-sqlite \
     --replace github.com/frinknet/caddy-sqlite=/src/caddy-sqlite \
-    --output /out/caddy \
-    && upx --best --lzma /out/caddy
+    --output /out/caddy
 
+# Collect licenses and the resolved version list from the *uncompressed*
+# binary: upx strips the Go build info, so this must run before compression.
 RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
-    GOMODCACHE=$(go env GOMODCACHE) && \
-    mkdir -p /out/licenses/caddy /out/licenses/plugins && \
-    for f in "$GOMODCACHE"/github.com/caddyserver/caddy/v2@*/LICENSE*; do \
-        [ -e "$f" ] && cp "$f" /out/licenses/caddy/; \
-    done && \
-    go version -m /out/caddy | awk '$1 == "dep" {print $2 "@" $3}' | while read -r modver; do \
+    sh -euxc ' \
+      GOMODCACHE=$(go env GOMODCACHE); \
+      mkdir -p /out/licenses/caddy /out/licenses/plugins; \
+      go version -m /out/caddy > /out/versions.txt; \
+      for f in "$GOMODCACHE"/github.com/caddyserver/caddy/v2@*/LICENSE*; do \
+        if [ -e "$f" ]; then cp "$f" /out/licenses/caddy/; fi; \
+      done; \
+      go version -m /out/caddy | awk '"'"'$1 == "dep" {print $2 "@" $3}'"'"' | while read -r modver; do \
         mod="${modver%@*}"; \
-        escaped=$(echo "$modver" | sed 's/[A-Z]/!\L&/g'); \
+        escaped=$(printf "%s" "$modver" | sed '"'"'s/[A-Z]/!\L&/g'"'"'); \
         dir="$GOMODCACHE/$escaped"; \
         if [ -d "$dir" ]; then \
-            pkg=$(echo "$mod" | tr / _); \
-            dest="/out/licenses/plugins/$pkg"; \
-            mkdir -p "$dest"; \
-            for lf in "$dir"/LICENSE* "$dir"/NOTICE*; do \
-                [ -e "$lf" ] && cp "$lf" "$dest/"; \
-            done; \
+          pkg=$(printf "%s" "$mod" | tr / _); \
+          dest="/out/licenses/plugins/$pkg"; \
+          mkdir -p "$dest"; \
+          for lf in "$dir"/LICENSE* "$dir"/NOTICE*; do \
+            if [ -e "$lf" ]; then cp "$lf" "$dest/"; fi; \
+          done; \
         fi; \
-    done
+      done; \
+      ls /out/licenses/plugins | wc -l'
+
+RUN upx --best --lzma /out/caddy
 
 # ---------------------------------------------------------------------------
 # Stage C: Compose scratch image
@@ -58,6 +70,7 @@ RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
 FROM scratch
 
 COPY --from=build /out/licenses             /usr/share/licenses
+COPY --from=build /out/versions.txt          /usr/share/licenses/versions.txt
 COPY --from=build /etc/ssl/certs           /etc/ssl/certs
 COPY --from=build /usr/share/zoneinfo      /usr/share/zoneinfo
 COPY --from=build /out/caddy               /bin/caddy

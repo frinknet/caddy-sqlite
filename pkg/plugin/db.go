@@ -2,11 +2,11 @@ package plugin
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"regexp"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -18,49 +18,61 @@ import (
 	"github.com/frinknet/caddy-sqlite/pkg/database"
 )
 
-var (
-	pendingMu sync.Mutex
-	pending   = map[string]*DBConfig{}
+const (
+	defaultBatchSize    = 128
+	defaultBatchTimeout = 5 * time.Millisecond
+	defaultCacheTTL     = 5 * time.Second
+	defaultCacheMax     = 1000
 )
 
+// DBConfig is one declared database. Its name is the schema every query uses to
+// address it, and its path is the file attached under that schema.
 type DBConfig struct {
-	Name         string
-	Path         string
+	Name       string
+	Path       string
+	MigrateDir string
+	ReadOnly   bool
+	Optimize   time.Duration
+	Backup     *database.BackupConfig
+}
+
+// EngineConfig holds the process-wide knobs: one read pool, one cache, one
+// write-batching policy.
+type EngineConfig struct {
 	BatchSize    int
 	BatchTimeout time.Duration
 	CacheTTL     time.Duration
 	CacheMax     int
-	ReadOnly     bool
-	MigrateDir   string
-	Optimize     time.Duration
-	Backup       *database.BackupConfig
+	Timeout      time.Duration
 }
 
-// ParseSQLiteDBOption is the UnmarshalGlobalFunc for `sqlite_db`. Caddy calls
-// it once per `sqlite_db NAME PATH { ... }` block in the global options
-// section. It parses the block, stores the config in `pending`, and returns an
-// httpcaddyfile.App so that the Caddyfile adapter injects the `sqlite` app into
-// AppsRaw. That makes ctx.App("sqlite") succeed in handlers without requiring
-// the user to write `apps { sqlite {} }`.
-//
-// The App.Value is `{}` (not the parsed config) because multiple sqlite_db
-// blocks share the same app name — real per-DB configs live in `pending` and
-// are consumed by SQLiteDBs.Provision.
-func ParseSQLiteDBOption(d *caddyfile.Dispenser, _ any) (any, error) {
+type pendingConfig struct {
+	engine EngineConfig
+	dbs    []*DBConfig
+}
+
+var (
+	pendingMu sync.Mutex
+	pending   *pendingConfig
+)
+
+var identifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// ParseGlobalOption is the UnmarshalGlobalFunc for `sqlite`. It parses the
+// engine knobs and every `db` declaration, stores them in `pending`, and
+// returns an httpcaddyfile.App so the adapter injects the app into AppsRaw.
+func ParseGlobalOption(d *caddyfile.Dispenser, _ any) (any, error) {
 	d.Next()
-	var name, path string
-	if !d.Args(&name, &path) {
-		return nil, d.ArgErr()
+
+	p := &pendingConfig{
+		engine: EngineConfig{
+			BatchSize:    defaultBatchSize,
+			BatchTimeout: defaultBatchTimeout,
+			CacheTTL:     defaultCacheTTL,
+			CacheMax:     defaultCacheMax,
+		},
 	}
 
-	cfg := &DBConfig{
-		Name:         name,
-		Path:         path,
-		BatchSize:    128,
-		BatchTimeout: 5 * time.Millisecond,
-		CacheTTL:     5 * time.Second,
-		CacheMax:     1000,
-	}
 	for n := d.Nesting(); d.NextBlock(n); {
 		switch d.Val() {
 		case "batch_size":
@@ -71,7 +83,7 @@ func ParseSQLiteDBOption(d *caddyfile.Dispenser, _ any) (any, error) {
 			if err != nil || v < 1 || v > 4096 {
 				return nil, d.Errf("batch_size must be 1..4096")
 			}
-			cfg.BatchSize = v
+			p.engine.BatchSize = v
 		case "batch_timeout":
 			if !d.NextArg() {
 				return nil, d.ArgErr()
@@ -80,7 +92,7 @@ func ParseSQLiteDBOption(d *caddyfile.Dispenser, _ any) (any, error) {
 			if err != nil || dur <= 0 || dur > time.Second {
 				return nil, d.Errf("batch_timeout must be >0 and <=1s")
 			}
-			cfg.BatchTimeout = dur
+			p.engine.BatchTimeout = dur
 		case "cache_ttl":
 			if !d.NextArg() {
 				return nil, d.ArgErr()
@@ -89,7 +101,7 @@ func ParseSQLiteDBOption(d *caddyfile.Dispenser, _ any) (any, error) {
 			if err != nil || dur < 0 {
 				return nil, d.Errf("cache_ttl: %v", err)
 			}
-			cfg.CacheTTL = dur
+			p.engine.CacheTTL = dur
 		case "cache_max":
 			if !d.NextArg() {
 				return nil, d.ArgErr()
@@ -98,13 +110,95 @@ func ParseSQLiteDBOption(d *caddyfile.Dispenser, _ any) (any, error) {
 			if err != nil || v < 0 {
 				return nil, d.Errf("cache_max: %v", err)
 			}
-			cfg.CacheMax = v
+			p.engine.CacheMax = v
+		case "timeout":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil || dur < 0 {
+				return nil, d.Errf("timeout: %v", err)
+			}
+			p.engine.Timeout = dur
+		case "db":
+			cfg, err := parseDBBlock(d)
+			if err != nil {
+				return nil, err
+			}
+			p.dbs = append(p.dbs, cfg)
+		default:
+			return nil, d.Errf("sqlite: unknown option %q", d.Val())
+		}
+	}
+
+	if len(p.dbs) == 0 {
+		return nil, d.Err("sqlite: at least one `db <name> <file>` is required")
+	}
+
+	seenName := map[string]bool{}
+	seenPath := map[string]string{}
+	for _, cfg := range p.dbs {
+		if seenName[cfg.Name] {
+			return nil, d.Errf("sqlite: db %q declared twice", cfg.Name)
+		}
+		seenName[cfg.Name] = true
+		if cfg.Name == database.ScratchSchema {
+			continue
+		}
+		if other, ok := seenPath[cfg.Path]; ok {
+			return nil, d.Errf("sqlite: db %q and %q both point to %q", cfg.Name, other, cfg.Path)
+		}
+		seenPath[cfg.Path] = cfg.Name
+	}
+
+	pendingMu.Lock()
+	pending = p
+	pendingMu.Unlock()
+
+	return httpcaddyfile.App{
+		Name:  "sqlite",
+		Value: []byte("{}"),
+	}, nil
+}
+
+func parseDBBlock(d *caddyfile.Dispenser) (*DBConfig, error) {
+	var name string
+	if !d.NextArg() {
+		return nil, d.ArgErr()
+	}
+	name = d.Val()
+
+	// `db main { ... }` declares the in-memory scratch: it has no file, so it
+	// carries only the schema migrations that give it tables at boot.
+	scratch := name == database.ScratchSchema
+	if !identifierRe.MatchString(name) {
+		return nil, d.Errf("db name %q must be an identifier (letters, digits, underscore)", name)
+	}
+	if name == "temp" {
+		return nil, d.Errf("db name %q is reserved by SQLite", name)
+	}
+
+	var path string
+	if scratch {
+		if d.NextArg() {
+			return nil, d.Errf("db main: the scratch schema has no file")
+		}
+	} else {
+		if !d.NextArg() {
+			return nil, d.ArgErr()
+		}
+		path = d.Val()
+	}
+
+	cfg := &DBConfig{Name: name, Path: path}
+	for n := d.Nesting(); d.NextBlock(n); {
+		switch d.Val() {
 		case "migrate":
 			if !d.NextArg() {
 				return nil, d.ArgErr()
 			}
 			cfg.MigrateDir = d.Val()
-		case "read_only":
+		case "readonly":
 			cfg.ReadOnly = true
 		case "optimize":
 			if !d.NextArg() {
@@ -132,7 +226,7 @@ func ParseSQLiteDBOption(d *caddyfile.Dispenser, _ any) (any, error) {
 					if len(args) == 0 {
 						return nil, d.ArgErr()
 					}
-					b.Schedule = strings.Join(args, " ")
+					b.Schedule = joinArgs(args)
 				case "dir":
 					if !d.NextArg() {
 						return nil, d.ArgErr()
@@ -153,165 +247,203 @@ func ParseSQLiteDBOption(d *caddyfile.Dispenser, _ any) (any, error) {
 			}
 			cfg.Backup = b
 		default:
-			return nil, d.Errf("sqlite_db: unknown option %q", d.Val())
+			return nil, d.Errf("db: unknown option %q", d.Val())
 		}
 	}
-
-	pendingMu.Lock()
-	pending[name] = cfg
-	pendingMu.Unlock()
-
-	return httpcaddyfile.App{
-		Name:  "sqlite",
-		Value: []byte("{}"),
-	}, nil
+	if scratch && cfg.MigrateDir == "" {
+		return nil, d.Errf("db main: the scratch schema needs a `migrate <dir>` to have tables")
+	}
+	if cfg.ReadOnly && (cfg.Optimize > 0 || cfg.Backup != nil) {
+		return nil, d.Errf("db %q: backup and optimize cannot be used with read_only", name)
+	}
+	return cfg, nil
 }
 
-type SQLiteDBs struct {
-	configs map[string]*DBConfig
-	pool    *database.Pool
-	stops   map[string][]func()
+func joinArgs(args []string) string {
+	out := ""
+	for i, a := range args {
+		if i > 0 {
+			out += " "
+		}
+		out += a
+	}
+	return out
+}
+
+// Engine is the app: it owns the cluster, applies migrations, and starts the
+// per-database maintenance jobs.
+type Engine struct {
+	engine  EngineConfig
+	dbs     []*DBConfig
+	cluster *database.Cluster
+	stops   []func()
+	handles []*sql.DB
 	log     *zap.Logger
 }
 
-func (SQLiteDBs) CaddyModule() caddy.ModuleInfo {
+func (Engine) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "sqlite",
-		New: func() caddy.Module { return new(SQLiteDBs) },
+		New: func() caddy.Module { return new(Engine) },
 	}
 }
 
-func (m *SQLiteDBs) Start() error { return nil }
+func (m *Engine) Start() error { return nil }
 
-func (m *SQLiteDBs) Stop() error { return nil }
+func (m *Engine) Stop() error { return nil }
 
-func (m *SQLiteDBs) Provision(ctx caddy.Context) (err error) {
+func (m *Engine) Provision(ctx caddy.Context) error {
 	m.log = ctx.Logger(m)
-	m.pool = database.NewPool()
-	m.configs = map[string]*DBConfig{}
-	m.stops = map[string][]func(){}
 
 	pendingMu.Lock()
-	cfgs := pending
-	pending = map[string]*DBConfig{}
+	p := pending
+	pending = nil
 	pendingMu.Unlock()
 
-	seen := map[string]string{}
-	for name, cfg := range cfgs {
-		p, perr := expandEnv(cfg.Path)
-		if perr != nil {
-			return fmt.Errorf("sqlite_db %q: %w", name, perr)
+	if p == nil {
+		return fmt.Errorf("sqlite: no `sqlite { db ... }` block was configured")
+	}
+	m.engine = p.engine
+	m.dbs = p.dbs
+
+	var (
+		attaches []database.Attach
+		writable []string
+	)
+	for _, cfg := range m.dbs {
+		if cfg.Name == database.ScratchSchema {
+			continue
 		}
-		if other, ok := seen[p]; ok {
-			return fmt.Errorf("sqlite_db %q and %q both point to %q", name, other, p)
+		path, err := expandEnv(cfg.Path)
+		if err != nil {
+			return fmt.Errorf("db %q: %w", cfg.Name, err)
 		}
-		seen[p] = name
+		if path == "" {
+			return fmt.Errorf("db %q: path resolved empty", cfg.Name)
+		}
+		cfg.Path = path
+
+		if cfg.MigrateDir != "" {
+			if err := m.migrate(ctx, cfg); err != nil {
+				m.cleanup()
+				return err
+			}
+		}
+		attaches = append(attaches, database.Attach{
+			Schema:   cfg.Name,
+			Path:     path,
+			ReadOnly: cfg.ReadOnly,
+		})
+		if !cfg.ReadOnly {
+			writable = append(writable, cfg.Name)
+		}
 	}
 
-	defer func() {
-		if err != nil {
-			m.cleanupAll()
-		}
-	}()
+	profile := database.Profile{
+		BatchSize:    m.engine.BatchSize,
+		BatchTimeout: m.engine.BatchTimeout,
+		CacheTTL:     m.engine.CacheTTL,
+		CacheMax:     m.engine.CacheMax,
+		Timeout:      m.engine.Timeout,
+	}
+	cluster, err := database.OpenCluster(ctx, attaches, writable, profile)
+	if err != nil {
+		m.cleanup()
+		return err
+	}
+	m.cluster = cluster
 
-	for name, cfg := range cfgs {
-		if err := m.provisionOne(ctx, name, cfg); err != nil {
+	for _, cfg := range m.dbs {
+		if cfg.Name == database.ScratchSchema {
+			if err := database.Apply(ctx, cluster.Anchor(), os.DirFS(cfg.MigrateDir), "."); err != nil {
+				m.cleanup()
+				return fmt.Errorf("db main: migrate: %w", err)
+			}
+			continue
+		}
+		if err := m.startMaintenance(cfg); err != nil {
+			m.cleanup()
 			return err
 		}
 	}
 	return nil
 }
 
-func (m *SQLiteDBs) provisionOne(ctx caddy.Context, name string, cfg *DBConfig) error {
-	path, err := expandEnv(cfg.Path)
+// migrate opens the file read-write, applies pending migrations, and closes it.
+// A database declared readonly is migrated here and only then attached mode=ro,
+// so the migration runs exactly once and serving stays read-only.
+func (m *Engine) migrate(ctx caddy.Context, cfg *DBConfig) error {
+	db, err := database.OpenDB(ctx, database.OpenConfig{Path: cfg.Path})
 	if err != nil {
-		return fmt.Errorf("sqlite_db %q: %w", name, err)
+		return fmt.Errorf("db %q: migrate: %w", cfg.Name, err)
 	}
-	if path == "" {
-		return fmt.Errorf("sqlite_db %q: path resolved empty", name)
-	}
-	if cfg.ReadOnly {
-		switch {
-		case cfg.MigrateDir != "":
-			return fmt.Errorf("sqlite_db %q: migrate cannot be used with read_only", name)
-		case cfg.Optimize > 0:
-			return fmt.Errorf("sqlite_db %q: optimize cannot be used with read_only", name)
-		case cfg.Backup != nil:
-			return fmt.Errorf("sqlite_db %q: backup cannot be used with read_only", name)
-		}
-	}
+	defer db.Close()
 
-	profile := database.Profile{
-		BatchSize:    cfg.BatchSize,
-		BatchTimeout: cfg.BatchTimeout,
-		CacheTTL:     cfg.CacheTTL,
-		CacheMax:     cfg.CacheMax,
-		ReadOnly:     cfg.ReadOnly,
+	if err := database.Apply(ctx, db, os.DirFS(cfg.MigrateDir), "."); err != nil {
+		return fmt.Errorf("db %q: migrate: %w", cfg.Name, err)
 	}
-	db, err := m.pool.Acquire(ctx, path, profile)
+	return nil
+}
+
+func (m *Engine) startMaintenance(cfg *DBConfig) error {
+	if cfg.Optimize <= 0 && cfg.Backup == nil {
+		return nil
+	}
+	db, err := database.OpenDB(context.Background(), database.OpenConfig{Path: cfg.Path})
 	if err != nil {
-		return fmt.Errorf("sqlite_db %q: %w", name, err)
+		return fmt.Errorf("db %q: maintenance handle: %w", cfg.Name, err)
 	}
-	m.configs[name] = cfg
-
-	if cfg.MigrateDir != "" {
-		if err := database.Apply(ctx, db.SQL(), os.DirFS(cfg.MigrateDir), "."); err != nil {
-			return fmt.Errorf("sqlite_db %q: migrate: %w", name, err)
-		}
-	}
+	m.handles = append(m.handles, db)
 
 	if cfg.Optimize > 0 && !cfg.ReadOnly {
 		stop := make(chan struct{})
 		go runOptimize(stop, db, cfg.Optimize, m.log)
-		m.stops[path] = append(m.stops[path], func() { close(stop) })
+		m.stops = append(m.stops, func() { close(stop) })
 	}
-
 	if cfg.Backup != nil && !cfg.ReadOnly {
-		sched, err := database.NewBackupScheduler(*cfg.Backup, db.SQL(), m.log)
+		sched, err := database.NewBackupScheduler(*cfg.Backup, db, m.log)
 		if err != nil {
-			return fmt.Errorf("sqlite_db %q: backup: %w", name, err)
+			return fmt.Errorf("db %q: %w", cfg.Name, err)
 		}
-		m.stops[path] = append(m.stops[path], sched.Close)
+		m.stops = append(m.stops, sched.Close)
 	}
 	return nil
 }
 
-func (m *SQLiteDBs) cleanupAll() {
-	for _, cfg := range m.configs {
-		path, _ := expandEnv(cfg.Path)
-		for _, s := range m.stops[path] {
-			s()
-		}
-		m.pool.Release(path)
+func (m *Engine) Cleanup() error {
+	m.cleanup()
+	return nil
+}
+
+func (m *Engine) cleanup() {
+	for _, stop := range m.stops {
+		stop()
 	}
 	m.stops = nil
-	m.configs = nil
-}
-
-func (m *SQLiteDBs) Cleanup() error {
-	m.cleanupAll()
-	return nil
-}
-
-func (m *SQLiteDBs) Lookup(name string) (*database.DB, error) {
-	cfg, ok := m.configs[name]
-	if !ok {
-		return nil, fmt.Errorf("sqlite: unknown database %q: declare it with `sqlite_db %s <path>`", name, name)
+	for _, db := range m.handles {
+		db.Close()
 	}
-	path, err := expandEnv(cfg.Path)
-	if err != nil {
-		return nil, fmt.Errorf("sqlite_db %q: %w", name, err)
+	m.handles = nil
+	if m.cluster != nil {
+		m.cluster.Close()
+		m.cluster = nil
 	}
-	return m.pool.Acquire(context.Background(), path, database.Profile{
-		BatchSize:    cfg.BatchSize,
-		BatchTimeout: cfg.BatchTimeout,
-		CacheTTL:     cfg.CacheTTL,
-		CacheMax:     cfg.CacheMax,
-		ReadOnly:     cfg.ReadOnly,
-	})
 }
 
-func runOptimize(stop chan struct{}, db *database.DB, every time.Duration, log *zap.Logger) {
+// Cluster is what handlers and templates run against.
+func (m *Engine) Cluster() *database.Cluster { return m.cluster }
+
+// DBConfig returns the declaration for a schema.
+func (m *Engine) DBConfig(name string) (*DBConfig, bool) {
+	for _, cfg := range m.dbs {
+		if cfg.Name == name {
+			return cfg, true
+		}
+	}
+	return nil, false
+}
+
+func runOptimize(stop chan struct{}, db *sql.DB, every time.Duration, log *zap.Logger) {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
@@ -319,7 +451,7 @@ func runOptimize(stop chan struct{}, db *database.DB, every time.Duration, log *
 		case <-stop:
 			return
 		case <-ticker.C:
-			if _, err := db.SQL().Exec("PRAGMA optimize"); err != nil {
+			if _, err := db.Exec("PRAGMA optimize"); err != nil && log != nil {
 				log.Warn("optimize failed", zap.Error(err))
 			}
 		}
@@ -347,7 +479,7 @@ func expandEnv(s string) (string, error) {
 }
 
 var (
-	_ caddy.Module       = (*SQLiteDBs)(nil)
-	_ caddy.Provisioner  = (*SQLiteDBs)(nil)
-	_ caddy.CleanerUpper = (*SQLiteDBs)(nil)
+	_ caddy.Provisioner  = (*Engine)(nil)
+	_ caddy.CleanerUpper = (*Engine)(nil)
+	_ caddy.App          = (*Engine)(nil)
 )

@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"path/filepath"
 	"sync"
@@ -192,6 +193,47 @@ func TestScanRowsNormalizesValues(t *testing.T) {
 	}
 	if rows[0]["absent"] != nil {
 		t.Fatalf("absent = %#v, want nil", rows[0]["absent"])
+	}
+}
+
+func TestNamedBindsSurviveTheBatcher(t *testing.T) {
+	_, db := newPoolDB(t, Profile{BatchSize: 4, BatchTimeout: 10 * time.Millisecond, CacheTTL: time.Minute, CacheMax: 8})
+	if _, err := db.SQL().Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	res, err := db.WriteStmt(context.Background(),
+		`INSERT INTO t (v) VALUES (:v) RETURNING id, v`, []any{sql.Named("v", "colon")}, true)
+	if err != nil {
+		t.Fatalf("colon bind: %v", err)
+	}
+	if !res.HasRows || res.Rows[0]["v"] != "colon" {
+		t.Fatalf("returned %+v", res)
+	}
+
+	if _, err := db.WriteStmt(context.Background(),
+		`INSERT INTO t (v) VALUES (@v)`, []any{sql.Named("v", "at")}, false); err != nil {
+		t.Fatalf("@ bind: %v", err)
+	}
+	if _, err := db.WriteStmt(context.Background(),
+		`INSERT INTO t (v) VALUES ($v)`, []any{sql.Named("v", "dollar")}, false); err != nil {
+		t.Fatalf("$ bind: %v", err)
+	}
+
+	rows, err := db.QueryCached(context.Background(), `SELECT v FROM t WHERE v = :want`, []any{sql.Named("want", "at")})
+	if err != nil {
+		t.Fatalf("named read: %v", err)
+	}
+	if len(rows) != 1 || rows[0]["v"] != "at" {
+		t.Fatalf("rows = %+v", rows)
+	}
+
+	all, err := db.QueryDirect(context.Background(), `SELECT v FROM t ORDER BY id`, nil)
+	if err != nil {
+		t.Fatalf("read all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("rows = %d, want 3 (all three bind styles must insert)", len(all))
 	}
 }
 

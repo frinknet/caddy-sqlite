@@ -3,6 +3,7 @@ package database
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -106,4 +107,87 @@ func stripComments(s string) string {
 	s = blockCommentRe.ReplaceAllString(s, " ")
 	s = lineCommentRe.ReplaceAllString(s, "")
 	return strings.TrimSpace(s)
+}
+
+var (
+	insertTargetRe = regexp.MustCompile(`(?is)\b(?:INSERT|REPLACE)\s+(?:OR\s+\w+\s+)?INTO\s+([^\s(,]+)`)
+	updateTargetRe = regexp.MustCompile(`(?is)\bUPDATE\s+(?:OR\s+\w+\s+)?([^\s(,]+)`)
+	deleteTargetRe = regexp.MustCompile(`(?is)\bDELETE\s+FROM\s+([^\s(,]+)`)
+	createTargetRe = regexp.MustCompile(`(?is)\bCREATE\s+(?:TEMP|TEMPORARY\s+)?(?:TABLE|VIEW|INDEX|TRIGGER)\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(,]+)`)
+	dropTargetRe   = regexp.MustCompile(`(?is)\bDROP\s+(?:TABLE|VIEW|INDEX|TRIGGER)\s+(?:IF\s+EXISTS\s+)?([^\s(,]+)`)
+	alterTargetRe  = regexp.MustCompile(`(?is)\bALTER\s+TABLE\s+([^\s(,]+)`)
+	reindexRe      = regexp.MustCompile(`(?is)\bREINDEX\s+([^\s(,]+)`)
+	analyzeRe      = regexp.MustCompile(`(?is)\bANALYZE\s+([^\s(,]+)`)
+	vacuumRe       = regexp.MustCompile(`(?is)\bVACUUM\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:$|INTO)`)
+	pragmaRe       = regexp.MustCompile(`(?is)^\s*PRAGMA\b`)
+)
+
+// WriteTarget reports which schema a write statement writes to. The returned
+// schema is empty when the statement names no schema, and error is non-nil when
+// it names more than one, which SQLite cannot make atomic across attached files.
+//
+// This is a token scan, not a parser: it looks for the object after INTO /
+// UPDATE / DELETE FROM / CREATE / DROP / ALTER / REINDEX / ANALYZE and the schema
+// after VACUUM. PRAGMA writes belong to the scratch schema, which is where an
+// unqualified pragma applies.
+func WriteTarget(sqlText string) (string, error) {
+	s := stripComments(sqlText)
+	if pragmaRe.MatchString(s) {
+		return ScratchSchema, nil
+	}
+
+	var schemas []string
+	collect := func(re *regexp.Regexp) {
+		for _, m := range re.FindAllStringSubmatch(s, -1) {
+			schemas = append(schemas, schemaOf(m[1]))
+		}
+	}
+	for _, re := range []*regexp.Regexp{
+		insertTargetRe, updateTargetRe, deleteTargetRe,
+		createTargetRe, dropTargetRe, alterTargetRe,
+		reindexRe, analyzeRe,
+	} {
+		collect(re)
+	}
+	// VACUUM names a schema directly, not a schema.table.
+	for _, m := range vacuumRe.FindAllStringSubmatch(s, -1) {
+		schemas = append(schemas, m[1])
+	}
+
+	distinct := map[string]bool{}
+	for _, sc := range schemas {
+		distinct[sc] = true
+	}
+	if len(distinct) > 1 {
+		names := make([]string, 0, len(distinct))
+		for sc := range distinct {
+			if sc == "" {
+				sc = "(unqualified)"
+			}
+			names = append(names, sc)
+		}
+		sort.Strings(names)
+		return "", fmt.Errorf("sqlite: a write may name one schema, found %s", strings.Join(names, ", "))
+	}
+	for sc := range distinct {
+		return sc, nil
+	}
+	return "", nil
+}
+
+// schemaOf splits "schema.table" and unquotes a quoted identifier.
+func schemaOf(target string) string {
+	target = strings.TrimSpace(target)
+	if i := strings.Index(target, "."); i >= 0 {
+		return unquoteIdentifier(target[:i])
+	}
+	return ""
+}
+
+func unquoteIdentifier(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && (s[0] == '"' || s[0] == '`' || s[0] == '[') {
+		return strings.Trim(s[1:len(s)-1], "\"`]")
+	}
+	return s
 }

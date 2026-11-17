@@ -3,9 +3,6 @@
 set -eu
 
 TMP=$(mktemp -d /tmp/caddy-e2e-XXXXXX)
-DB="$TMP/test.db"
-CERT="$TMP/cert.pem"
-KEY="$TMP/key.pem"
 PORT=9099
 IMAGE="${E2E_IMAGE:-caddysqlite-e2e}"
 CONTAINER_NAME="caddysqlite-e2e-runner"
@@ -18,51 +15,54 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── Seed schema via migration ──────────────────────────
-# Statements are prepared at provision time, so every table referenced by
-# a handler must exist before Caddy starts. The migration runs on open.
-mkdir -p "$TMP/migrations"
+# ── Migrations for each declared database ──────────────
+mkdir -p "$TMP/migrations" "$TMP/extra-migrations" "$TMP/ro-migrations" "$TMP/bk-migrations" "$TMP/scratch-migrations"
+
 cat > "$TMP/migrations/0001_init.sql" << 'SQL'
 CREATE TABLE IF NOT EXISTS items (
-    id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    label TEXT
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    label  TEXT,
+    tag_id INTEGER
 );
+SQL
+
+cat > "$TMP/extra-migrations/0001_init.sql" << 'SQL'
+CREATE TABLE IF NOT EXISTS tags (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+SQL
+
+# This database is declared readonly: the engine migrates it once on open and
+# then serves it mode=ro, so the seed row proves the migration ran.
+cat > "$TMP/ro-migrations/0001_init.sql" << 'SQL'
+CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY, label TEXT);
+INSERT INTO snapshots (label) VALUES ('seed');
+SQL
+
+cat > "$TMP/scratch-migrations/0001_init.sql" << 'SQL'
+CREATE TABLE IF NOT EXISTS hits (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT);
+SQL
+
+cat > "$TMP/bk-migrations/0001_init.sql" << 'SQL'
+CREATE TABLE IF NOT EXISTS bk_items (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT);
 SQL
 
 # ── Template file for the {{ sqlite }} function ────────
 mkdir -p "$TMP/tpl"
 cat > "$TMP/tpl/index.html" << 'TPL'
-{{ sqlite "e2e" "SELECT id, label FROM items WHERE label = 'first'" }}
+{{ range sqlite "SELECT id, label FROM e2e.items WHERE label = 'first'" }}{{ .label }}{{ end }}
 TPL
 
-# ── Seed the read-only DB fixture ──────────────────────
-# `validate` provisions the app (open + migrate) and exits, leaving the
-# file behind for the read_only database in the main config.
-mkdir -p "$TMP/ro-migrations"
-cat > "$TMP/ro-migrations/0001_init.sql" << 'SQL'
-CREATE TABLE IF NOT EXISTS ro_items (id INTEGER PRIMARY KEY, label TEXT);
-INSERT INTO ro_items (label) VALUES ('seed');
-SQL
-
-mkdir -p "$TMP/bk-migrations"
-cat > "$TMP/bk-migrations/0001_init.sql" << 'SQL'
-CREATE TABLE IF NOT EXISTS bk_items (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT);
-SQL
+# ── Reusable REST snippet under test ───────────────────
+mkdir -p "$TMP/snippets"
+cp snippets/rest.caddyfile "$TMP/snippets/rest.caddyfile"
 
 # Pre-create the backup dir so it stays host-owned: the container writes
 # root-owned files into it, and only a writable directory lets the user
 # delete them again at cleanup.
 mkdir -p "$TMP/backups"
-cat > "$TMP/seed-ro.Caddyfile" << 'CADDY'
-{
-	admin off
-	sqlite_db seed /data/ro.db {
-		migrate /data/ro-migrations
-	}
-}
-CADDY
-docker run --rm -v "$TMP:/data" -v "$TMP/seed-ro.Caddyfile:/etc/caddy/Caddyfile:ro" "$IMAGE" \
-	validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || true
 
 # ── Create test Caddyfile ──────────────────────────────
 cat > "$TMP/Caddyfile" << 'CADDY'
@@ -70,207 +70,247 @@ cat > "$TMP/Caddyfile" << 'CADDY'
 	admin off
 	debug
 
-	sqlite_db e2e /data/test.db {
+	sqlite {
 		batch_size    8
 		batch_timeout 2ms
 		cache_ttl     5s
 		cache_max     100
-		migrate       /data/migrations
-		optimize      1h
-	}
+		timeout       30s
 
-	sqlite_db ro /data/ro.db {
-		read_only
-	}
+		db e2e /data/test.db {
+			migrate  /data/migrations
+			optimize 1h
+		}
 
-	sqlite_db bk /data/bk.db {
-		migrate /data/bk-migrations
-		backup {
-			schedule @every 1s
-			dir      /data/backups
-			retain   2
+		db extra /data/extra.db {
+			migrate /data/extra-migrations
+		}
+
+		db ro /data/ro.db {
+			migrate  /data/ro-migrations
+			readonly
+		}
+
+		db main {
+			migrate /data/scratch-migrations
+		}
+
+		db bk /data/bk.db {
+			migrate /data/bk-migrations
+			backup {
+				schedule @every 1s
+				dir      /data/backups
+				retain   2
+			}
 		}
 	}
 }
+
+# Snippets are defined at the top level, outside any site block.
+import /data/snippets/rest.caddyfile
 
 :80 {
-# Create schema
-route /setup {
-	sqlite_response {
-		use    e2e
-		query  "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT)"
-		output json
-		cache  0
-	}
-}
+	# The REST snippet needs the method matchers declared once per site.
+	@get    method GET
+	@post   method POST
+	@put    method PUT
+	@patch  method PATCH
+	@delete method DELETE
 
-# Insert — write through batcher
-route /insert {
-	sqlite_response {
-		use    e2e
-		query  "INSERT INTO items (label) VALUES (json_extract(?, '$.label'))"
-		bind   1 {http.request.body}
-		output json
-	}
-}
+	import rest tags extra.tags name
 
-# Read all — cached read
-route /items {
-	sqlite_response {
-		use    e2e
-		query  "SELECT id, label FROM items ORDER BY id"
-		output json
-	}
-}
-
-# Count — cached read
-route /count {
-	sqlite_response {
-		use    e2e
-		query  "SELECT COUNT(*) AS cnt FROM items"
-		output json
-	}
-}
-
-# Insert RETURNING
-route /insert-returning {
-	sqlite_response {
-		use    e2e
-		query  "INSERT INTO items (label) VALUES (json_extract(?, '$.label')) RETURNING id, label"
-		bind   1 {http.request.body}
-		output json
-	}
-}
-
-# Health endpoint the UDF routes below call back into
-route /health {
-	sqlite_response {
-		use    e2e
-		query  "SELECT 'alive' AS health"
-		output json
-	}
-}
-
-# http_get UDF
-route /http-get {
-	sqlite_response {
-		use    e2e
-		query  "SELECT http_get(json_extract(?, '$.url')) AS result"
-		bind   1 {http.request.body}
-		output json
-	}
-}
-
-# http_post UDF
-route /http-post {
-	sqlite_response {
-		use    e2e
-		query  "SELECT http_post(json_extract(?, '$.url'), json_extract(?, '$.data')) AS result"
-		bind   1 {http.request.body}
-		bind   2 {http.request.body}
-		output json
-	}
-}
-
-# XML output
-route /items-xml {
-	sqlite_response {
-		use    e2e
-		query  "SELECT id, label FROM items ORDER BY id"
-		output xml
-	}
-}
-
-# Plain output
-route /items-plain {
-	sqlite_response {
-		use    e2e
-		query  "SELECT id, label FROM items ORDER BY id"
-		output plain
-	}
-}
-
-# CSV output
-route /items-csv {
-	sqlite_response {
-		use    e2e
-		query  "SELECT id, label FROM items ORDER BY id"
-		output csv
-	}
-}
-
-# output=dynamic, columns deliberately out of order
-route /dynamic {
-	sqlite_response {
-		use    e2e
-		query  "SELECT 'text/plain' AS content_type, 'from-dynamic' AS content, 201 AS http_code"
-		output dynamic
-	}
-}
-
-# sqlite_bg: async write, 202 + job id
-route /bg-insert {
-	sqlite_bg {
-		use    e2e
-		query  "INSERT INTO items (label) VALUES (json_extract(?, '$.label'))"
-		bind   1 {http.request.body}
-	}
-}
-
-# sqlite_bg with a webhook that records its own delivery
-route /bg-webhook {
-	sqlite_bg {
-		use    e2e
-		query  "INSERT INTO items (label) VALUES ('bg-hook')"
-		on_complete {
-			url    http://127.0.0.1:80/webhook-hit
-			method POST
+	# DDL through a handler: writes must name their schema, and output none
+	# answers with a bare status.
+	route /setup {
+		sqlite {
+			query  "CREATE TABLE IF NOT EXISTS e2e.items (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT, tag_id INTEGER)"
+			output none
+			status 204
 		}
 	}
-}
 
-route /webhook-hit {
-	sqlite_response {
-		use    e2e
-		query  "INSERT INTO items (label) VALUES ('webhook-fired')"
-		output json
-		cache  0
-	}
-}
-
-# Read-only DB
-route /ro {
-	sqlite_response {
-		use    ro
-		query  "SELECT id, label FROM ro_items ORDER BY id"
-		output json
-	}
-}
-
-# Backed-up DB: writes land in every VACUUM INTO snapshot
-route /bk-insert {
-	sqlite_response {
-		use    bk
-		query  "INSERT INTO bk_items (label) VALUES (json_extract(?, '$.label'))"
-		bind   1 {http.request.body}
-		output json
-		cache  0
-	}
-}
-
-# {{ sqlite }} template function
-handle_path /tpl/* {
-	templates {
-		extensions {
-			sqlite
+	# Positional binds
+	route /insert {
+		sqlite {
+			query  "INSERT INTO e2e.items (label) VALUES (json_extract(?, '$.label'))"
+			bind   1 {http.request.body}
+			output json
 		}
 	}
-	file_server {
-		root /data/tpl
+
+	# Named binds
+	route /named-insert {
+		sqlite {
+			query  "INSERT INTO e2e.items (label, tag_id) VALUES (json_extract(:body, '$.label'), :tag) RETURNING id, label"
+			bind   body {http.request.body}
+			bind   tag  {http.request.uri.query.tag}
+			output json
+			status 201
+		}
 	}
-}
+
+	# Cached read
+	route /items {
+		sqlite {
+			query  "SELECT id, label FROM e2e.items ORDER BY id"
+			output json
+		}
+	}
+
+	# Cross-schema join: items live in e2e, tags in extra
+	route /joined {
+		sqlite {
+			query  "SELECT i.id, i.label, t.name AS tag
+			        FROM e2e.items i LEFT JOIN extra.tags t ON t.id = i.tag_id
+			        ORDER BY i.id"
+			output json
+		}
+	}
+
+	route /count {
+		sqlite {
+			query  "SELECT COUNT(*) AS cnt FROM e2e.items"
+			output json
+		}
+	}
+
+	# Read-only schema, migrated on open then frozen
+	route /ro {
+		sqlite {
+			query  "SELECT id, label FROM ro.snapshots ORDER BY id"
+			output json
+		}
+	}
+
+	# In-memory scratch
+	route /scratch-hit {
+		sqlite {
+			query  "INSERT INTO main.hits (path) VALUES (?) RETURNING id"
+			bind   1 {http.request.uri.path}
+			output json
+		}
+	}
+
+	route /scratch-count {
+		sqlite {
+			query  "SELECT COUNT(*) AS hits FROM main.hits"
+			output json
+		}
+	}
+
+	# Fire-and-forget: no response here, the next handler answers
+	route /queued {
+		sqlite {
+			query    "INSERT INTO e2e.items (label) VALUES (json_extract(:body, '$.label'))"
+			bind     body {http.request.body}
+			continue
+		}
+		respond "queued" 202
+	}
+
+	# Status codes
+	route /insert-returning {
+		sqlite {
+			query  "INSERT INTO e2e.items (label) VALUES (json_extract(:body, '$.label')) RETURNING id, label"
+			bind   body {http.request.body}
+			output json
+			status 201
+		}
+	}
+
+	route /health {
+		sqlite {
+			query  "SELECT 'alive' AS health"
+			output json
+		}
+	}
+
+	# UDFs
+	route /http-get {
+		sqlite {
+			query  "SELECT http_get(json_extract(?, '$.url')) AS result"
+			bind   1 {http.request.body}
+			output json
+		}
+	}
+
+	route /http-post {
+		sqlite {
+			query  "SELECT http_post(json_extract(?, '$.url'), json_extract(?, '$.data')) AS result"
+			bind   1 {http.request.body}
+			bind   2 {http.request.body}
+			output json
+		}
+	}
+
+	# Output formats
+	route /dynamic {
+		sqlite {
+			query  "SELECT 'text/plain' AS content_type, 'from-dynamic' AS content, 201 AS http_code"
+			output dynamic
+		}
+	}
+
+	route /items-xml {
+		sqlite {
+			query  "SELECT id, label FROM e2e.items ORDER BY id"
+			output xml
+		}
+	}
+
+	route /items-plain {
+		sqlite {
+			query  "SELECT id, label FROM e2e.items ORDER BY id"
+			output plain
+		}
+	}
+
+	route /items-csv {
+		sqlite {
+			query  "SELECT id, label FROM e2e.items ORDER BY id"
+			output csv
+		}
+	}
+
+	route /backed-up {
+		sqlite {
+			query  "INSERT INTO bk.bk_items (label) VALUES (json_extract(?, '$.label'))"
+			bind   1 {http.request.body}
+			output json
+		}
+	}
+
+	# {{ sqlite }} template function
+	handle_path /tpl/* {
+		templates {
+			extensions {
+				sqlite
+			}
+		}
+		file_server {
+			root /data/tpl
+		}
+	}
 }
 CADDY
+
+# ── Test 0: the image runs the versions go.mod pins ────
+# The container and `go test` must resolve the same dependencies: a newer
+# driver in the image is exactly how user-defined functions disappeared once.
+echo ""
+echo "=== Test 0: dependency versions ==="
+for mod in "modernc.org/sqlite" "github.com/caddyserver/caddy/v2"; do
+	want=$(awk -v m="$mod" '$1 == m && $2 ~ /^v/ {print $2}' go.mod)
+	got=$(docker run --rm --entrypoint /bin/cat "$IMAGE" /usr/share/licenses/versions.txt 2>/dev/null \
+		| awk -v m="$mod" '$1 == "dep" && $2 == m {print $3}')
+	if [ -n "$want" ] && [ "$want" = "$got" ]; then
+		echo "  PASS: $mod $got matches go.mod"
+		PASS=$((PASS + 1))
+	else
+		echo "  FAIL: $mod: go.mod pins ${want:-nothing}, image has ${got:-nothing}"
+		FAIL=$((FAIL + 1))
+	fi
+done
 
 echo "=== Starting Caddy container ==="
 docker run -d \
@@ -281,7 +321,6 @@ docker run -d \
 	"$IMAGE" \
 	run --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1
 
-# Wait for Caddy to be ready
 echo "=== Waiting for Caddy ==="
 for i in 1 2 3 4 5 6 7 8 9 10; do
 	if curl -sf http://127.0.0.1:$PORT/health >/dev/null 2>&1; then
@@ -304,124 +343,139 @@ check() {
 	fi
 }
 
-# ── Test 1: Setup schema ────────────────────────────────
+# ── Test 1: DDL through a handler ──────────────────────
 echo ""
-echo "=== Test 1: Setup schema ==="
-RESP=$(curl -sf http://127.0.0.1:$PORT/setup)
-check "setup creates table" '"status":"ok"' "$RESP"
+echo "=== Test 1: setup ==="
+RESP=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/setup)
+check "setup returns 204" '204' "$RESP"
 
-# ── Test 2: Insert first item ───────────────────────────
+# ── Test 2: positional binds ───────────────────────────
 echo ""
-echo "=== Test 2: Insert item 1 ==="
+echo "=== Test 2: positional binds ==="
 RESP=$(curl -sf -X POST -d '{"label":"first"}' http://127.0.0.1:$PORT/insert)
 check "insert first" '"affected":1' "$RESP"
-
-# ── Test 3: Insert second item ──────────────────────────
-echo ""
-echo "=== Test 3: Insert item 2 ==="
 RESP=$(curl -sf -X POST -d '{"label":"second"}' http://127.0.0.1:$PORT/insert)
 check "insert second" '"affected":1' "$RESP"
 
-# ── Test 4: Read all items ─────────────────────────────
+# ── Test 3: cached read ────────────────────────────────
 echo ""
-echo "=== Test 4: Read all items ==="
+echo "=== Test 3: cached read ==="
 RESP=$(curl -sf http://127.0.0.1:$PORT/items)
-check "read items returns 2" '"rows":' "$RESP"
-check "read items has first" '"first"' "$RESP"
-check "read items has second" '"second"' "$RESP"
+check "rows returned" '"rows":' "$RESP"
+check "first row present" '"first"' "$RESP"
+check "second row present" '"second"' "$RESP"
 
-# ── Test 5: Count ──────────────────────────────────────
-echo ""
-echo "=== Test 5: Count ==="
 RESP=$(curl -sf http://127.0.0.1:$PORT/count)
 check "count is 2" '"cnt":2' "$RESP"
 
-# ── Test 6: Insert RETURNING ───────────────────────────
+# ── Test 4: named binds + status code ──────────────────
 echo ""
-echo "=== Test 6: Insert RETURNING ==="
-RESP=$(curl -sf -X POST -d '{"label":"third"}' http://127.0.0.1:$PORT/insert-returning)
-check "insert returning has rows" '"rows":' "$RESP"
-check "insert returning has id 3" '"id":3' "$RESP"
-check "insert returning has label" '"third"' "$RESP"
+echo "=== Test 4: named binds ==="
+RESP=$(curl -sS -o /tmp/e2e-named.json -w '%{http_code}' -X POST \
+	-d '{"label":"named"}' "http://127.0.0.1:$PORT/named-insert?tag=1")
+check "named insert returns 201" '201' "$RESP"
+check "named insert body" '"named"' "$(cat /tmp/e2e-named.json)"
+rm -f /tmp/e2e-named.json
 
-# ── Test 7: http_get UDF ──────────────────────────────
+# ── Test 5: cross-schema join ──────────────────────────
 echo ""
-echo "=== Test 7: http_get UDF ==="
+echo "=== Test 5: cross-schema join ==="
+RESP=$(curl -sS -X POST -d '{"name":"blue"}' http://127.0.0.1:$PORT/api/tags)
+check "tag created via REST snippet" '"blue"' "$RESP"
+RESP=$(curl -sf http://127.0.0.1:$PORT/joined)
+check "join returns the tag name" '"blue"' "$RESP"
+
+# ── Test 6: read-only schema ───────────────────────────
+echo ""
+echo "=== Test 6: read-only schema ==="
+RESP=$(curl -sf http://127.0.0.1:$PORT/ro)
+check "read-only schema was migrated on open" '"seed"' "$RESP"
+
+# ── Test 7: in-memory scratch ──────────────────────────
+echo ""
+echo "=== Test 7: scratch ==="
+RESP=$(curl -sf http://127.0.0.1:$PORT/scratch-hit)
+check "scratch write returns an id" '"id":' "$RESP"
+RESP=$(curl -sf http://127.0.0.1:$PORT/scratch-count)
+check "scratch read sees it" '"hits":1' "$RESP"
+
+# ── Test 8: continue passes the request on ─────────────
+echo ""
+echo "=== Test 8: continue ==="
+RESP=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -d '{"label":"bg"}' http://127.0.0.1:$PORT/queued)
+check "next handler answers" '202' "$RESP"
+sleep 1
+RESP=$(curl -sf http://127.0.0.1:$PORT/items)
+check "background write landed" '"bg"' "$RESP"
+
+# ── Test 9: UDFs ───────────────────────────────────────
+echo ""
+echo "=== Test 9: UDFs ==="
 RESP=$(curl -sf -X POST -d '{"url":"http://127.0.0.1:80/health"}' http://127.0.0.1:$PORT/http-get)
-check "http_get returns health body" 'alive' "$RESP"
-
-# ── Test 8: http_post UDF ─────────────────────────────
-echo ""
-echo "=== Test 8: http_post UDF ==="
+check "http_get returns the health body" 'alive' "$RESP"
 RESP=$(curl -sf -X POST -d '{"url":"http://127.0.0.1:80/health","data":"{}"}' http://127.0.0.1:$PORT/http-post)
-check "http_post returns health body" 'alive' "$RESP"
+check "http_post returns the health body" 'alive' "$RESP"
 
-# ── Test 9: XML output ─────────────────────────────────
+# ── Test 10: output formats ────────────────────────────
 echo ""
-echo "=== Test 9: XML output ==="
+echo "=== Test 10: output formats ==="
+RESP=$(curl -sS -i http://127.0.0.1:$PORT/dynamic)
+check "dynamic status" '201' "$RESP"
+check "dynamic content type" 'Content-Type: text/plain' "$RESP"
+check "dynamic body" 'from-dynamic' "$RESP"
+
 RESP=$(curl -sf http://127.0.0.1:$PORT/items-xml)
-check "xml response" '<response' "$RESP"
 check "xml rows" '<rows>' "$RESP"
 check "xml row data" '<label>first</label>' "$RESP"
 
-# ── Test 10: Plain output ──────────────────────────────
-echo ""
-echo "=== Test 10: Plain output ==="
 RESP=$(curl -sf http://127.0.0.1:$PORT/items-plain)
 check "plain text" 'first' "$RESP"
-check "plain text" 'second' "$RESP"
-check "plain text" 'third' "$RESP"
 
-# ── Test 11: CSV output ───────────────────────────────
-echo ""
-echo "=== Test 11: CSV output ==="
 RESP=$(curl -sf http://127.0.0.1:$PORT/items-csv)
 check "csv header" 'id,label' "$RESP"
 check "csv data" '1,first' "$RESP"
 
-# ── Test 12: dynamic output ────────────────────────────
+# ── Test 11: template function ─────────────────────────
 echo ""
-echo "=== Test 12: dynamic output ==="
-RESP=$(curl -sS -i http://127.0.0.1:$PORT/dynamic)
-check "dynamic status 201" '201' "$RESP"
-check "dynamic content type" 'Content-Type: text/plain' "$RESP"
-check "dynamic body" 'from-dynamic' "$RESP"
-
-# ── Test 13: sqlite_bg async write ─────────────────────
-echo ""
-echo "=== Test 13: sqlite_bg ==="
-RESP=$(curl -sS -X POST -d '{"label":"bg"}' http://127.0.0.1:$PORT/bg-insert)
-check "bg accepted" '"status":"accepted"' "$RESP"
-check "bg job id" '"job_id"' "$RESP"
-sleep 1
-RESP=$(curl -sf http://127.0.0.1:$PORT/items)
-check "bg write landed" '"bg"' "$RESP"
-
-# ── Test 14: {{ sqlite }} template function ────────────
-echo ""
-echo "=== Test 14: template function ==="
+echo "=== Test 11: template function ==="
 RESP=$(curl -sf http://127.0.0.1:$PORT/tpl/index.html)
 check "template ran sqlite" 'first' "$RESP"
 
-# ── Test 15: read_only DB ──────────────────────────────
+# ── Test 12: REST snippet ──────────────────────────────
 echo ""
-echo "=== Test 15: read_only DB ==="
-RESP=$(curl -sf http://127.0.0.1:$PORT/ro)
-check "read-only DB serves rows" '"seed"' "$RESP"
+echo "=== Test 12: REST snippet ==="
+RESP=$(curl -sf http://127.0.0.1:$PORT/api/tags)
+check "list" '"rows":' "$RESP"
 
-# ── Test 16: sqlite_bg webhook ─────────────────────────
-echo ""
-echo "=== Test 16: sqlite_bg webhook ==="
-RESP=$(curl -sS -X POST http://127.0.0.1:$PORT/bg-webhook)
-check "bg webhook accepted" '"status":"accepted"' "$RESP"
-sleep 1
-RESP=$(curl -sf http://127.0.0.1:$PORT/items)
-check "bg job write landed" '"bg-hook"' "$RESP"
-check "webhook fired" '"webhook-fired"' "$RESP"
+RESP=$(curl -sS -X POST -d '{"name":"red"}' http://127.0.0.1:$PORT/api/tags)
+check "create returns the row" '"red"' "$RESP"
+ID=$(echo "$RESP" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+check "created row has an id" '^[0-9]' "$ID"
 
-# ── Test 17: scheduled backup ──────────────────────────
+RESP=$(curl -sf http://127.0.0.1:$PORT/api/tags/$ID)
+check "fetch returns the row" '"red"' "$RESP"
+
+RESP=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/api/tags/99999)
+check "missing row returns 404" '404' "$RESP"
+
+RESP=$(curl -sf -X PATCH -d '{"name":"crimson"}' http://127.0.0.1:$PORT/api/tags/$ID)
+check "patch updates the row" '"crimson"' "$RESP"
+
+RESP=$(curl -sf -X PUT -d '{"name":"scarlet"}' http://127.0.0.1:$PORT/api/tags/$ID)
+check "put replaces the row" '"scarlet"' "$RESP"
+
+RESP=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE http://127.0.0.1:$PORT/api/tags/$ID)
+check "delete returns 204" '204' "$RESP"
+
+RESP=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/api/tags/$ID)
+check "deleted row is gone" '404' "$RESP"
+
+RESP=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT http://127.0.0.1:$PORT/api/tags)
+check "unmatched method returns 405" '405' "$RESP"
+
+# ── Test 13: scheduled backup ──────────────────────────
 echo ""
-echo "=== Test 17: scheduled backup ==="
+echo "=== Test 13: scheduled backup ==="
 BK_COUNT=0
 for i in 1 2 3 4 5 6 7 8 9 10; do
 	BK_COUNT=$(ls "$TMP/backups" 2>/dev/null | grep -c '^bk-.*\.db$' || true)
@@ -431,8 +485,8 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
 	sleep 0.5
 done
 
-RESP=$(curl -sS -X POST -d '{"label":"bk-seed"}' http://127.0.0.1:$PORT/bk-insert)
-check "backed-up DB accepts writes" '"affected":1' "$RESP"
+RESP=$(curl -sf -X POST -d '{"label":"bk-seed"}' http://127.0.0.1:$PORT/backed-up)
+check "backed-up database accepts writes" '"affected":1' "$RESP"
 sleep 2.5
 
 NEWEST=$(ls -t "$TMP/backups" 2>/dev/null | grep '^bk-.*\.db$' | head -1)
@@ -472,7 +526,7 @@ else
 	FAIL=$((FAIL + 1))
 fi
 
-# ── Tests 18+: provision-time validation ───────────────
+# ── Test 14: provision-time validation ─────────────────
 echo ""
 echo "=== Provision-time validation ==="
 
@@ -495,35 +549,106 @@ neg() {
 	fi
 }
 
-cat > "$TMP/neg-ro-migrate.Caddyfile" << 'CADDY'
+cat > "$TMP/neg-unqualified.Caddyfile" << 'CADDY'
 {
 	admin off
-	sqlite_db ro /data/ro.db {
-		read_only
-		migrate /data/migrations
+	sqlite {
+		db app /data/test.db
 	}
 }
-CADDY
-
-cat > "$TMP/neg-ro-backup.Caddyfile" << 'CADDY'
-{
-	admin off
-	sqlite_db ro /data/ro.db {
-		read_only
-		backup {
-			schedule * * * * *
-			dir      /data/backups
+:8080 {
+	route /x {
+		sqlite {
+			query  "INSERT INTO items (label) VALUES ('x')"
+			output json
 		}
 	}
 }
 CADDY
 
-cat > "$TMP/neg-ro-optimize.Caddyfile" << 'CADDY'
+cat > "$TMP/neg-readonly-write.Caddyfile" << 'CADDY'
 {
 	admin off
-	sqlite_db ro /data/ro.db {
-		read_only
-		optimize 1h
+	sqlite {
+		db ro /data/ro.db {
+			readonly
+		}
+	}
+}
+:8080 {
+	route /x {
+		sqlite {
+			query  "INSERT INTO ro.snapshots (label) VALUES ('x')"
+			output json
+		}
+	}
+}
+CADDY
+
+cat > "$TMP/neg-unknown-schema.Caddyfile" << 'CADDY'
+{
+	admin off
+	sqlite {
+		db app /data/test.db
+	}
+}
+:8080 {
+	route /x {
+		sqlite {
+			query  "INSERT INTO nope.t (x) VALUES (1)"
+			output json
+		}
+	}
+}
+CADDY
+
+cat > "$TMP/neg-two-schemas.Caddyfile" << 'CADDY'
+{
+	admin off
+	sqlite {
+		db app   /data/test.db
+		db extra /data/extra.db
+	}
+}
+:8080 {
+	route /x {
+		sqlite {
+			query  "INSERT INTO app.items (id) SELECT id FROM extra.tags; DELETE FROM extra.tags"
+			output json
+		}
+	}
+}
+CADDY
+
+cat > "$TMP/neg-readonly-backup.Caddyfile" << 'CADDY'
+{
+	admin off
+	sqlite {
+		db ro /data/ro.db {
+			readonly
+			backup {
+				schedule @daily
+				dir      /data/backups
+			}
+		}
+	}
+}
+CADDY
+
+cat > "$TMP/neg-use.Caddyfile" << 'CADDY'
+{
+	admin off
+	sqlite {
+		db app /data/test.db
+	}
+}
+:8080 {
+	route /x {
+		sqlite {
+			use    app
+			query  "SELECT 1"
+			output json
+		}
 	}
 }
 CADDY
@@ -531,67 +656,58 @@ CADDY
 cat > "$TMP/neg-env.Caddyfile" << 'CADDY'
 {
 	admin off
-	sqlite_db envtest /data/{env.CADDYSQLITE_E2E_UNSET}.db
+	sqlite {
+		db envtest /data/{env.CADDYSQLITE_E2E_UNSET}.db
+	}
 }
 :8080 {
 	respond "ok"
 }
 CADDY
 
-cat > "$TMP/neg-alias.Caddyfile" << 'CADDY'
-{
-	admin off
-	sqlite_db e2e /data/test.db
-}
-:8080 {
-	route /x {
-		sqlite_response {
-			use    nope
-			query  "SELECT COUNT(*) AS n FROM items"
-			output json
-		}
-	}
-}
-CADDY
-
 cat > "$TMP/neg-method.Caddyfile" << 'CADDY'
 {
 	admin off
-	sqlite_db e2e /data/test.db {
-		backup {
-			method   cp
-			schedule * * * * *
-			dir      /data/backups
+	sqlite {
+		db app /data/test.db {
+			backup {
+				method   cp
+				schedule @daily
+				dir      /data/backups
+			}
 		}
 	}
 }
 CADDY
 
-cat > "$TMP/neg-ro-write.Caddyfile" << 'CADDY'
+cat > "$TMP/neg-continue-output.Caddyfile" << 'CADDY'
 {
 	admin off
-	sqlite_db ro /data/ro.db {
-		read_only
+	sqlite {
+		db app /data/test.db
 	}
 }
 :8080 {
 	route /x {
-		sqlite_response {
-			use    ro
-			query  "INSERT INTO ro_items (label) VALUES ('nope')"
-			output json
+		sqlite {
+			query    "INSERT INTO app.items (label) VALUES ('x')"
+			output   json
+			continue
 		}
+		respond "ok"
 	}
 }
 CADDY
 
-neg "read_only + migrate fails" "$TMP/neg-ro-migrate.Caddyfile" 'migrate cannot be used with read_only'
-neg "read_only + backup fails" "$TMP/neg-ro-backup.Caddyfile" 'backup cannot be used with read_only'
-neg "read_only + optimize fails" "$TMP/neg-ro-optimize.Caddyfile" 'optimize cannot be used with read_only'
-neg "write to read_only fails" "$TMP/neg-ro-write.Caddyfile" 'read-only'
+neg "unqualified write fails" "$TMP/neg-unqualified.Caddyfile" 'must name a schema'
+neg "write to read-only schema fails" "$TMP/neg-readonly-write.Caddyfile" 'read-only database'
+neg "unknown schema fails" "$TMP/neg-unknown-schema.Caddyfile" 'unknown database'
+neg "write naming two schemas fails" "$TMP/neg-two-schemas.Caddyfile" 'one schema'
+neg "readonly + backup fails" "$TMP/neg-readonly-backup.Caddyfile" 'cannot be used with read_only'
+neg "use is gone" "$TMP/neg-use.Caddyfile" 'unknown option'
 neg "missing env var fails" "$TMP/neg-env.Caddyfile" 'CADDYSQLITE_E2E_UNSET'
-neg "unknown alias fails" "$TMP/neg-alias.Caddyfile" 'unknown database'
 neg "unsupported backup method fails" "$TMP/neg-method.Caddyfile" 'unsupported method'
+neg "continue with output fails" "$TMP/neg-continue-output.Caddyfile" 'cannot be combined with output'
 
 # ── Summary ────────────────────────────────────────────
 echo ""

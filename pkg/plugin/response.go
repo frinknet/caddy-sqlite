@@ -9,18 +9,18 @@ import (
 	"sort"
 )
 
-func writeJSONRows(w http.ResponseWriter, rows []map[string]any) {
+func writeJSONRows(w http.ResponseWriter, status int, rows []map[string]any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(response{
 		Status: "ok",
 		Data:   map[string]any{"rows": rows},
 	})
 }
 
-func writeXMLRows(w http.ResponseWriter, rows []map[string]any) {
+func writeXMLRows(w http.ResponseWriter, status int, rows []map[string]any) {
 	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(status)
 	w.Write([]byte("<response status=\"ok\"><rows>"))
 	for _, row := range rows {
 		w.Write([]byte("<row>"))
@@ -52,9 +52,9 @@ func xmlSafeTag(s string) string {
 	return b.String()
 }
 
-func writeCSVRows(w http.ResponseWriter, rows []map[string]any) {
+func writeCSVRows(w http.ResponseWriter, status int, rows []map[string]any) {
 	w.Header().Set("Content-Type", "text/csv")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(status)
 	cw := csv.NewWriter(w)
 	defer cw.Flush()
 
@@ -78,9 +78,9 @@ func writeCSVRows(w http.ResponseWriter, rows []map[string]any) {
 	}
 }
 
-func writePlainRows(w http.ResponseWriter, rows []map[string]any) {
+func writePlainRows(w http.ResponseWriter, status int, rows []map[string]any) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(status)
 	for i, row := range rows {
 		if i > 0 {
 			w.Write([]byte("\n"))

@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test with the race detector
+        run: go test -race ./...
+
+  e2e:
+    name: end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build the image
+        run: docker build -t caddysqlite-e2e .
+
+      # The suite starts with a version check: the container must resolve the
+      # same Caddy and SQLite driver that go.mod pins, or the tests are
+      # exercising something other than what ships.
+      - name: run the end-to-end suite
+        run: sh test/e2e.sh
+
+      # Guard the license collection: upx strips the Go build info, so an
+      # ordering mistake here silently ships zero dependency licenses.
+      - name: dependency licenses are present
+        run: |
+          count=$(docker run --rm --entrypoint /bin/sh caddysqlite-e2e \
+            -c 'ls /usr/share/licenses/plugins | wc -l')
+          echo "license directories: $count"
+          if [ "$count" -lt 100 ]; then
+            echo "the image is missing dependency licenses"
+            exit 1
+          fi

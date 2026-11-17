@@ -28,7 +28,7 @@ func TestResolveKeepsJSONBody(t *testing.T) {
 	repl := caddy.NewReplacer()
 	repl.Set("http.request.body", `{"label":"first"}`)
 
-	m := &SQLiteResponse{
+	m := &SQLite{
 		Binds:      []Bind{{Name: "1", Value: "{http.request.body}"}},
 		positional: true,
 	}
