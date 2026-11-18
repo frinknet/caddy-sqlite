@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 FROM caddy:2.11.9-builder-alpine AS build
 
-RUN apk add --no-cache ca-certificates tzdata curl upx
+RUN apk add --no-cache ca-certificates tzdata curl
 
 ARG TARGETARCH
 RUN case "${TARGETARCH}" in \
@@ -36,11 +36,10 @@ RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
 RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
     --mount=type=cache,id=gobuild,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux \
-    xcaddy build "${CADDY_VERSION}" \
+    xcaddy build \
     --with github.com/frinknet/caddy-sqlite \
     --replace github.com/frinknet/caddy-sqlite=/src \
-    --output /out/caddy \
-    && upx --best --lzma /out/caddy
+    --output /out/caddy
 
 # collect the licenses of caddy and every plugin linked into the binary
 RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
