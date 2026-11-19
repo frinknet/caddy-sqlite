@@ -25,9 +25,8 @@
 	}
 }
 
-# The REST snippet lives next to this file and is installed beside it in the
-# image (outside the served root, so it is not downloadable). Snippets are
-# defined at the top level, outside any site block.
+# The REST snippet is imported by name from this Caddyfile's directory.
+# Snippets are defined at the top level, outside any site block.
 import rest.caddyfile
 
 :80 {

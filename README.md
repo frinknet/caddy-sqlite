@@ -580,10 +580,12 @@ engine-wide.
 ## Reusable REST pattern
 
 `www/rest.caddyfile` ships a full CRUD resource — list, create, fetch, update,
-patch, delete with `201`/`404`/`204`/`405` responses. The demo image installs it
-next to the Caddyfile (`/etc/caddy/rest.caddyfile`, outside the served root), and
-the demo config uses it for `/api/tags`. Import it at the top level, declare the
-method matchers once per site, then instantiate it per resource:
+patch, delete with `201`/`404`/`204`/`405` responses. The image keeps it at
+`/etc/caddy/rest.caddyfile`, outside the served root. A relative import resolves
+against the importing Caddyfile's directory, so the snippet must sit beside the
+Caddyfile that imports it. The demo config uses it for `/api/tags`. Import it at
+the top level, declare the method matchers once per site, then instantiate it
+per resource:
 
 ```caddyfile
 # next to the Caddyfile that imports it
@@ -719,15 +721,17 @@ example.com {
 - Reads run on one pool whose connections carry every schema; writes route to the
   owning schema's batcher, which keeps every batch inside a single file and so
   keeps commits atomic.
+- `test/unit.sh` runs `gofmt`, `go vet` and the unit tests in the builder image;
+  it never touches a host Go toolchain.
 - `test/e2e.sh` runs the built image and exercises every endpoint, output format,
   bind mode, the REST snippet, backups, and the provision-time rejections.
 
 ## Build
 
 ```sh
-./build.sh                       # builds the image (tags <repo>:test and <repo>-e2e)
-sh test/e2e.sh                   # runs the end-to-end suite against it
-go test ./...                    # unit tests
+./build.sh                       # builds the image (tags <repo>:test)
+sh test/unit.sh                  # gofmt, vet and unit tests in the builder image
+sh test/e2e.sh                   # runs the end-to-end suite against that image
 ```
 
 ## Known caveats

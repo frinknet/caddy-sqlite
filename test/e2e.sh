@@ -4,7 +4,8 @@ set -eu
 
 TMP=$(mktemp -d /tmp/caddy-e2e-XXXXXX)
 PORT=9099
-IMAGE="${E2E_IMAGE:-caddysqlite-e2e}"
+SLUG=$(sed -n '1s/^[^:]*: //p' ./NOTICE)
+IMAGE="${E2E_IMAGE:-${SLUG}:test}"
 CONTAINER_NAME="caddysqlite-e2e-runner"
 PASS=0
 FAIL=0

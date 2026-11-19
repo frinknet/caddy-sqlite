@@ -90,8 +90,7 @@ sed -i -e "s|${REPOFROM}|${SLUG}|g" ./Dockerfile
 sed -i -e "s|${REPOFROM}|${SLUG}|g" ./go.mod
 
 if [ "$INIT" -eq 0 ]; then
-  E2EIMG=$(printf '%s' "${SLUG}" | tr -d -)-e2e
   docker rmi "${REPOSLUG}" 2>/dev/null || true
   docker rmi "${SLUG}" 2>/dev/null || true
-  docker build -t "${SLUG}:test" -t "${E2EIMG}" .
+  docker build -t "${SLUG}:test" .
 fi
