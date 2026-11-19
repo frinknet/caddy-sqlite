@@ -15,25 +15,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: gofmt
+      - name: gofmt, vet and unit tests
         run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "these files need gofmt:"
-            echo "$unformatted"
-            exit 1
-          fi
+          docker run --rm \
+            -v "$PWD":/src -w /src \
+            -e GOMODCACHE=/mod -e GOCACHE=/mod/gocache -e CGO_ENABLED=0 \
+            caddy:2.11.9-builder-alpine \
+            sh -c 'gofmt -l . && go vet ./... && go test -count=1 ./...'
 
-      - name: vet
-        run: go vet ./...
-
-      - name: test with the race detector
-        run: go test -race ./...
+      - name: race detector
+        run: |
+          docker run --rm \
+            -v "$PWD":/src -w /src \
+            -e GOMODCACHE=/mod -e GOCACHE=/mod/gocache -e CGO_ENABLED=1 \
+            caddy:2.11.9-builder-alpine \
+            sh -c 'apk add --no-cache gcc musl-dev && go test -race -count=1 ./...'
 
   e2e:
     name: end-to-end
@@ -42,19 +38,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: build the image
-        run: docker build -t caddysqlite-e2e .
+        run: ./build.sh
 
       # The suite starts with a version check: the container must resolve the
       # same Caddy and SQLite driver that go.mod pins, or the tests are
-      # exercising something other than what ships.
+      # exercising something other than what ships. It also boots the image on
+      # its shipped config, so a broken default Caddyfile fails here.
       - name: run the end-to-end suite
-        run: sh test/e2e.sh
+        run: E2E_IMAGE=caddy-sqlite:test sh test/e2e.sh
 
-      # Guard the license collection: upx strips the Go build info, so an
-      # ordering mistake here silently ships zero dependency licenses.
+      # Guard the license collection: stripped Go build info silently ships
+      # zero dependency licenses, so count the directories instead of trusting
+      # the Dockerfile step.
       - name: dependency licenses are present
         run: |
-          count=$(docker run --rm --entrypoint /bin/sh caddysqlite-e2e \
+          count=$(docker run --rm --entrypoint /bin/sh caddy-sqlite:test \
             -c 'ls /usr/share/licenses/plugins | wc -l')
           echo "license directories: $count"
           if [ "$count" -lt 100 ]; then

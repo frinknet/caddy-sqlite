@@ -25,9 +25,11 @@
 	}
 }
 
-# The REST snippet is imported by name from this Caddyfile's directory.
+# The image keeps the REST snippet at /etc/caddy/rest.caddyfile, outside the
+# served root. The import is absolute because a relative one resolves against
+# this Caddyfile's directory (/srv/www), where the snippet no longer sits.
 # Snippets are defined at the top level, outside any site block.
-import rest.caddyfile
+import /etc/caddy/rest.caddyfile
 
 :80 {
 	# The snippet needs the method matchers declared once per site; matcher
@@ -66,8 +68,9 @@ import rest.caddyfile
 		}
 	}
 
-	# Schema files are not public.
-	handle /migrations/* {
+	# The Caddyfile and the schema files are not public.
+	@private path /Caddyfile /migrations/*
+	handle @private {
 		respond "Not Found" 404
 	}
 

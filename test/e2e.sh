@@ -7,11 +7,13 @@ PORT=9099
 SLUG=$(sed -n '1s/^[^:]*: //p' ./NOTICE)
 IMAGE="${E2E_IMAGE:-${SLUG}:test}"
 CONTAINER_NAME="caddysqlite-e2e-runner"
+DEFAULT_NAME="caddysqlite-e2e-default"
+DEFAULT_PORT=9098
 PASS=0
 FAIL=0
 
 cleanup() {
-	docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+	docker rm -f "$CONTAINER_NAME" "$DEFAULT_NAME" 2>/dev/null || true
 	rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -765,6 +767,56 @@ neg "unused bind fails" "$TMP/neg-bind-unused.Caddyfile" 'never used by the sql'
 neg "missing env var fails" "$TMP/neg-env.Caddyfile" 'CADDYSQLITE_E2E_UNSET'
 neg "unsupported backup method fails" "$TMP/neg-method.Caddyfile" 'unsupported method'
 neg "continue with output fails" "$TMP/neg-continue-output.Caddyfile" 'cannot be combined with output'
+
+# ── Test 15: the image boots on its shipped config ─────
+# Every other test mounts a generated Caddyfile, so only this one exercises
+# /srv/www/Caddyfile and the snippet location the image actually ships. A
+# broken import there kills the container before it serves anything.
+echo ""
+echo "=== Test 15: shipped default config ==="
+docker rm -f "$DEFAULT_NAME" >/dev/null 2>&1 || true
+docker run -d --name "$DEFAULT_NAME" -p "127.0.0.1:$DEFAULT_PORT:80" "$IMAGE" >/dev/null 2>&1 || true
+
+for i in 1 2 3 4 5 6 7 8 9 10; do
+	if curl -sf "http://127.0.0.1:$DEFAULT_PORT/" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+
+if [ "$(docker inspect -f '{{.State.Running}}' "$DEFAULT_NAME" 2>/dev/null || echo missing)" = "true" ]; then
+	echo "  PASS: container stays up on its shipped config"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL: container exited on its shipped config"
+	docker logs "$DEFAULT_NAME" 2>&1 | tail -5 | sed 's/^/    /'
+	FAIL=$((FAIL + 1))
+fi
+
+BODY=$(curl -sf "http://127.0.0.1:$DEFAULT_PORT/" 2>/dev/null || true)
+if [ "$BODY" = "$(cat www/index.html)" ]; then
+	echo "  PASS: demo page served byte for byte"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL: demo page differs from www/index.html"
+	FAIL=$((FAIL + 1))
+fi
+
+check "REST snippet answers /api/notes" '"rows":' \
+	"$(curl -sf "http://127.0.0.1:$DEFAULT_PORT/api/notes" 2>/dev/null || true)"
+check "aggregate answers /api/health" '"notes":' \
+	"$(curl -sf "http://127.0.0.1:$DEFAULT_PORT/api/health" 2>/dev/null || true)"
+check "Caddyfile is not downloadable" '404' \
+	"$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$DEFAULT_PORT/Caddyfile" 2>/dev/null || true)"
+check "migrations are not downloadable" '404' \
+	"$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$DEFAULT_PORT/migrations/0001_init.sql" 2>/dev/null || true)"
+check "demo write returns 201" '201' \
+	"$(curl -sS -o /dev/null -w '%{http_code}' -X POST -d '{"body":"shipped"}' \
+		"http://127.0.0.1:$DEFAULT_PORT/api/notes" 2>/dev/null || true)"
+check "demo list shows the write" '"shipped"' \
+	"$(curl -sf "http://127.0.0.1:$DEFAULT_PORT/api/notes" 2>/dev/null || true)"
+
+docker rm -f "$DEFAULT_NAME" >/dev/null 2>&1 || true
 
 # ── Summary ────────────────────────────────────────────
 echo ""

@@ -581,16 +581,21 @@ engine-wide.
 
 `www/rest.caddyfile` ships a full CRUD resource — list, create, fetch, update,
 patch, delete with `201`/`404`/`204`/`405` responses. The image keeps it at
-`/etc/caddy/rest.caddyfile`, outside the served root. A relative import resolves
-against the importing Caddyfile's directory, so the snippet must sit beside the
-Caddyfile that imports it. The demo config uses it for `/api/tags`. Import it at
-the top level, declare the method matchers once per site, then instantiate it
-per resource:
+`/etc/caddy/rest.caddyfile`, outside the served root, and its demo config imports
+that absolute path; a relative import resolves against the importing Caddyfile's
+directory (`/srv/www` in the image), where the snippet no longer sits. The demo
+config uses it for `/api/notes` and `/api/tags`. Import it at the top level,
+declare the method matchers once per site, then instantiate it per resource:
 
 ```caddyfile
-# next to the Caddyfile that imports it
-import rest.caddyfile
+# the image's own config
+import /etc/caddy/rest.caddyfile
+```
 
+Your own config can import an absolute path too, or a copy placed beside the
+importing file (`import rest.caddyfile`). Then, per resource:
+
+```caddyfile
 example.com {
 	@get    method GET
 	@post   method POST
@@ -724,7 +729,9 @@ example.com {
 - `test/unit.sh` runs `gofmt`, `go vet` and the unit tests in the builder image;
   it never touches a host Go toolchain.
 - `test/e2e.sh` runs the built image and exercises every endpoint, output format,
-  bind mode, the REST snippet, backups, and the provision-time rejections.
+  bind mode, the REST snippet, backups, and the provision-time rejections. It
+  also starts the image with no overrides, so a broken default config or snippet
+  location fails the suite instead of surfacing on the first `docker run`.
 
 ## Build
 
